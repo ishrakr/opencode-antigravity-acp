@@ -7,7 +7,7 @@ import type { QuotaProviderUsageData, QuotaProviderWindow } from "@openchamber/s
 const FIVE_HOURS = 5 * 3_600
 const DAY = 24 * 3_600
 const WEEK = 7 * DAY
-/** Inside OpenChamber's 20 s deadline for one usage read. */
+/** Inside OpenChamber's 20 s deadline for one service request. */
 const AGY_TIMEOUT_MS = 15_000
 const ERROR_MAX = 2_000
 
@@ -98,8 +98,8 @@ export function toUsageData(output: AgyQuotaOutput): QuotaProviderUsageData {
         : "agy reported no quota groups. Sign in with `agy` and try again.",
     )
   }
-  // The header and Work Status show the top-level windows: for each window,
-  // the group closest to its limit, so the badge warns when any group is.
+  // Top-level windows summarise the groups: for each window, the group
+  // closest to its limit.
   const windows: Record<string, QuotaProviderWindow> = {}
   for (const model of Object.values(models)) {
     for (const [key, window] of Object.entries(model.windows)) {

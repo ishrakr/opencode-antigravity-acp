@@ -1,8 +1,7 @@
-// OpenChamber usage provider for Antigravity. OpenChamber starts this service,
-// posts `usage.read` to /quota, and draws the answer on its Usage page. The
-// Work Status section reads the same data from GET /usage.
+// Local service for the Antigravity section in Work Status. OpenChamber starts
+// it; the section reads the quota from GET /usage through the host proxy.
 import http from "node:http"
-import { QUOTA_PROVIDER_PATH, readQuotaProviderRequest, type QuotaProviderResult, type QuotaProviderUsageData } from "@openchamber/sdk"
+import type { QuotaProviderUsageData } from "@openchamber/sdk"
 import { runAgyQuota } from "./quota.ts"
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT)
@@ -32,24 +31,10 @@ const readQuota = () => {
   return inFlight
 }
 
-const send = (
-  res: http.ServerResponse,
-  status: number,
-  body: QuotaProviderResult | QuotaProviderUsageData | { ok: true } | { error: string },
-): void => {
+const send = (res: http.ServerResponse, status: number, body: QuotaProviderUsageData | { ok: true } | { error: string }): void => {
   res.writeHead(status, { "Content-Type": "application/json" })
   res.end(JSON.stringify(body))
 }
-
-const readBody = (req: http.IncomingMessage): Promise<string> =>
-  new Promise((resolve, reject) => {
-    let body = ""
-    req.on("data", (chunk) => {
-      body += chunk
-    })
-    req.on("end", () => resolve(body))
-    req.on("error", reject)
-  })
 
 const server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${serviceToken}`) {
@@ -61,26 +46,13 @@ const server = http.createServer((req, res) => {
     send(res, 200, { ok: true })
     return
   }
-  // The Work Status section reads the same cached reading through the host proxy.
   if (url.pathname === "/usage" && req.method === "GET") {
     readQuota()
       .then((data) => send(res, 200, data))
       .catch(() => send(res, 500, { error: "could not read the quota" }))
     return
   }
-  if (url.pathname !== QUOTA_PROVIDER_PATH || req.method !== "POST") {
-    send(res, 404, { error: "not-found" })
-    return
-  }
-  readBody(req)
-    .then(async (body) => {
-      if (!readQuotaProviderRequest(body)) {
-        send(res, 400, { error: "not a usage call this service understands" })
-        return
-      }
-      send(res, 200, { ok: true, data: await readQuota() })
-    })
-    .catch(() => send(res, 500, { error: "could not read the request" }))
+  send(res, 404, { error: "not-found" })
 })
 
 server.listen(port, "127.0.0.1")
