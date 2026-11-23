@@ -1,7 +1,7 @@
 {
   "name": "antigravity-quota",
-  "version": "1.0.0",
-  "description": "Antigravity quota in OpenChamber's Usage page, read from agy's own /quota command",
+  "version": "1.1.0",
+  "description": "Antigravity quota in OpenChamber's Work Status and Usage page, read from agy's own /quota command",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -16,12 +16,21 @@
         "name": "Antigravity",
         "icon": "rocket"
       },
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "Antigravity",
+        "height": 24
+      },
       "service": {
         "entry": "service/main.js",
         "runtime": "host",
-        "provides": ["quota"],
+        "provides": [
+          "quota"
+        ],
         "permissions": {
-          "exec": ["agy"]
+          "exec": [
+            "agy"
+          ]
         }
       },
       "quota": {
@@ -30,7 +39,7 @@
     }
   },
   "scripts": {
-    "build": "bun build src/main.ts --target=node --format=esm --outfile=service/main.js",
+    "build": "bun run scripts/build.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test ./test"
   },

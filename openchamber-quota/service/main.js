@@ -353,6 +353,10 @@ var server = http.createServer((req, res) => {
     send(res, 200, { ok: true });
     return;
   }
+  if (url.pathname === "/usage" && req.method === "GET") {
+    readQuota().then((data) => send(res, 200, data)).catch(() => send(res, 500, { error: "could not read the quota" }));
+    return;
+  }
   if (url.pathname !== QUOTA_PROVIDER_PATH || req.method !== "POST") {
     send(res, 404, { error: "not-found" });
     return;

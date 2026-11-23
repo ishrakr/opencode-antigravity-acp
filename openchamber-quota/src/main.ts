@@ -1,7 +1,8 @@
 // OpenChamber usage provider for Antigravity. OpenChamber starts this service,
-// posts `usage.read` to /quota, and draws the answer on its Usage page.
+// posts `usage.read` to /quota, and draws the answer on its Usage page. The
+// Work Status section reads the same data from GET /usage.
 import http from "node:http"
-import { QUOTA_PROVIDER_PATH, readQuotaProviderRequest, type QuotaProviderResult } from "@openchamber/sdk"
+import { QUOTA_PROVIDER_PATH, readQuotaProviderRequest, type QuotaProviderResult, type QuotaProviderUsageData } from "@openchamber/sdk"
 import { runAgyQuota } from "./quota.ts"
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT)
@@ -31,7 +32,11 @@ const readQuota = () => {
   return inFlight
 }
 
-const send = (res: http.ServerResponse, status: number, body: QuotaProviderResult | { ok: true } | { error: string }): void => {
+const send = (
+  res: http.ServerResponse,
+  status: number,
+  body: QuotaProviderResult | QuotaProviderUsageData | { ok: true } | { error: string },
+): void => {
   res.writeHead(status, { "Content-Type": "application/json" })
   res.end(JSON.stringify(body))
 }
@@ -54,6 +59,13 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1")
   if (url.pathname === "/health") {
     send(res, 200, { ok: true })
+    return
+  }
+  // The Work Status section reads the same cached reading through the host proxy.
+  if (url.pathname === "/usage" && req.method === "GET") {
+    readQuota()
+      .then((data) => send(res, 200, data))
+      .catch(() => send(res, 500, { error: "could not read the quota" }))
     return
   }
   if (url.pathname !== QUOTA_PROVIDER_PATH || req.method !== "POST") {
