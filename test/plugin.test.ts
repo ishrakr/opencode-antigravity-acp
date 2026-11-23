@@ -29,7 +29,18 @@ import {
   stripUnsafeInternalLines,
 } from "../src/history-sanitizer.js"
 import { McpRelayServer } from "../src/mcp-relay.js"
-import { elicitationToQuestions, parseQuestionToolAnswers } from "../src/question-bridge.js"
+import {
+  elicitationToQuestions,
+  isAcpUserInputRequest,
+  parseQuestionToolAnswers,
+  permissionToQuestion,
+} from "../src/question-bridge.js"
+import {
+  describeAcpToolCall,
+  describeAcpToolResult,
+  isAcpToolName,
+  unifiedDiff,
+} from "../src/tool-display.js"
 import {
   SessionBridgeManager,
   quotaBucketForModel,
@@ -189,13 +200,13 @@ describe("SessionBridgeManager native ACP tool results", () => {
 
     const calls = parts.filter((p) => p.type === "tool-call")
     expect(calls.map((p) => [p.toolCallId, p.toolName])).toEqual([
-      ["read", "acp_read_file"],
-      ["run", "acp_run_command"],
+      ["read", "antigravity.read"],
+      ["run", "antigravity.shell"],
     ])
     const results = parts.filter((p) => p.type === "tool-result")
     expect(results.map((p) => [p.toolCallId, p.toolName, p.result, p.isError])).toEqual([
-      ["read", "acp_read_file", "file text", false],
-      ["run", "acp_run_command", "command failed", true],
+      ["read", "antigravity.read", "file text", false],
+      ["run", "antigravity.shell", "command failed", true],
     ])
   })
 
@@ -209,7 +220,7 @@ describe("SessionBridgeManager native ACP tool results", () => {
     expect(results).toHaveLength(1)
     expect(results[0]).toMatchObject({
       toolCallId: "run",
-      toolName: "acp_run_command",
+      toolName: "antigravity.shell",
       result: { status: "unknown" },
       isError: true,
     })
@@ -225,10 +236,300 @@ describe("SessionBridgeManager native ACP tool results", () => {
     expect(results).toHaveLength(1)
     expect(results[0]).toMatchObject({
       toolCallId: "read",
-      toolName: "acp_read",
+      toolName: "antigravity.read",
       result: "file text",
       isError: false,
     })
+  })
+})
+
+describe("Antigravity tool display (shapes recorded from agy 1.5.14)", () => {
+  const file = "/tmp/acp-test-dir/hello.txt"
+
+  test("maps agy tools to OpenCode-style names and inputs", () => {
+    expect(
+      describeAcpToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "c1",
+        name: "read_file",
+        kind: "read",
+        rawInput: { Path: file, StartLine: 10, EndLine: 19 },
+        locations: [{ path: file }],
+      }),
+    ).toEqual({ name: "antigravity.read", input: { path: file, offset: 10, limit: 10 } })
+    expect(
+      describeAcpToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "c2",
+        name: "edit_file",
+        kind: "edit",
+        rawInput: { Path: file, Target: "beta", Replacement: "BETA" },
+      }),
+    ).toEqual({ name: "antigravity.edit", input: { path: file, oldString: "beta", newString: "BETA" } })
+    expect(
+      describeAcpToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "c3",
+        name: "run_command",
+        kind: "execute",
+        rawInput: { CommandLine: "ls -la", WaitMsBeforeAsync: 5000, toolSummary: "List files" },
+      }),
+    ).toEqual({ name: "antigravity.shell", input: { command: "ls -la", description: "List files" } })
+    expect(
+      describeAcpToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "c4",
+        name: "write_file",
+        rawInput: { Path: file, Content: "hi", Overwrite: true },
+      }),
+    ).toEqual({ name: "antigravity.write", input: { path: file, content: "hi" } })
+    expect(
+      describeAcpToolCall({
+        sessionUpdate: "tool_call",
+        toolCallId: "c5",
+        name: "manage_task",
+        rawInput: { Action: "list" },
+      }),
+    ).toEqual({ name: "antigravity.manage_task", input: { Action: "list" } })
+  })
+
+  test("turns an edit's diff content into a unified diff and ignores the empty rawOutput", () => {
+    const result = describeAcpToolResult(
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "c2",
+        name: "edit_file",
+        status: "completed",
+        rawOutput: {},
+        locations: [{ path: file }],
+        content: [{ type: "diff", path: file, oldText: "alpha\nbeta\ngamma\n", newText: "alpha\nBETA\ngamma\n" }],
+      },
+      "/tmp/acp-test-dir",
+    )
+    expect(result).toBe(
+      "Index: hello.txt\n===================================================================\n--- hello.txt\n+++ hello.txt\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+    )
+  })
+
+  test("returns command output without agy's header, and the exit code when it failed", () => {
+    const update = (exit_code: number) => ({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "c3",
+      name: "run_command",
+      kind: "execute",
+      status: "completed",
+      rawOutput: {
+        output:
+          "Created At: 2026-11-23T14:39:43-06:00\nCompleted At: 2026-11-23T14:39:44-06:00\nCommand exited with code 0.\n\nCommand output:\nalpha\r\nBETA\r\n",
+        exit_code,
+      },
+    })
+    expect(describeAcpToolResult(update(0))).toBe("alpha\nBETA")
+    expect(describeAcpToolResult(update(2))).toBe("alpha\nBETA\n\nExit code 2")
+  })
+
+  test("describes a read that returns no content by its path", () => {
+    expect(
+      describeAcpToolResult(
+        {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "c1",
+          name: "read_file",
+          kind: "read",
+          status: "completed",
+          title: "File hello.txt",
+          locations: [{ path: file }],
+        },
+        "/tmp/acp-test-dir",
+      ),
+    ).toBe("Read hello.txt")
+  })
+
+  test("unified diff keeps far-apart changes in separate hunks", () => {
+    const before = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n") + "\n"
+    const after = before.replace("line 2\n", "LINE 2\n").replace("line 18\n", "LINE 18\n")
+    const diff = unifiedDiff("f.txt", before, after)
+    expect(diff).toContain("@@ -1,5 +1,5 @@\n line 1\n-line 2\n+LINE 2\n")
+    expect(diff).toContain("@@ -15,6 +15,6 @@\n line 15\n line 16\n line 17\n-line 18\n+LINE 18\n")
+  })
+
+  test("history sanitizer still flattens renamed and legacy Antigravity tools", () => {
+    for (const name of ["antigravity.shell", "acp_run_command"]) {
+      const msgs: any[] = [
+        { role: "assistant", content: [{ type: "tool-call", name, input: { command: "ls" }, providerExecuted: true }] },
+      ]
+      sanitizeForNonAcpModel(msgs)
+      expect(msgs[0].content[0].type).toBe("text")
+      expect(isAcpToolName(name)).toBe(true)
+    }
+    expect(isAcpToolName("shell")).toBe(false)
+  })
+
+  test("streams the readable tool call and result through doStream", async () => {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: ({ onUpdate }) =>
+        ({
+          isClosed: false,
+          initialize: async () => ({}),
+          authenticate: async () => ({}),
+          newSession: async () => ({ sessionId: "acp-display" }),
+          setModel: async () => {},
+          setMode: async () => {},
+          notifyCancel: () => {},
+          dispose: async () => {},
+          prompt: async (sid: string) => {
+            onUpdate?.(sid, {
+              sessionUpdate: "tool_call",
+              toolCallId: "e1",
+              name: "edit_file",
+              kind: "edit",
+              status: "in_progress",
+              rawInput: { Path: file, Target: "beta", Replacement: "BETA" },
+              locations: [{ path: file }],
+            })
+            onUpdate?.(sid, {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "e1",
+              name: "edit_file",
+              kind: "edit",
+              status: "completed",
+              rawOutput: {},
+              content: [{ type: "diff", path: file, oldText: "beta\n", newText: "BETA\n" }],
+            })
+            return { stopReason: "end_turn" }
+          },
+        }) as any,
+    })
+    try {
+      const { stream } = await bridge.createLanguageModel("gemini-4-neon").doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "edit" }] }],
+        headers: { "x-opencode-session-id": "ses-display" },
+      } as any)
+      const parts = await readAllParts(stream)
+      const call = parts.find((p) => p.type === "tool-call")
+      expect(call.toolName).toBe("antigravity.edit")
+      expect(JSON.parse(call.input)).toEqual({ path: file, oldString: "beta", newString: "BETA" })
+      const result = parts.find((p) => p.type === "tool-result")
+      expect(result.toolName).toBe("antigravity.edit")
+      expect(result.result).toContain("-beta\n+BETA")
+    } finally {
+      await bridge.disposeAll()
+    }
+  })
+})
+
+describe("Antigravity native choice questions and prompt outcomes", () => {
+  test("bridges interaction_ permission requests to OpenCode questions, not approvals", () => {
+    const params = {
+      toolCall: { toolCallId: "interaction_1", title: "Which database?" },
+      options: [
+        { optionId: "opt_pg", name: "Postgres", kind: "allow_once" },
+        { optionId: "opt_sqlite", name: "SQLite", kind: "allow_once" },
+      ],
+    }
+    expect(isAcpUserInputRequest(params)).toBe(true)
+    expect(isAcpUserInputRequest({ toolCall: { toolCallId: "call_1" } })).toBe(false)
+    const bridged = permissionToQuestion(params)!
+    expect(bridged.question).toEqual({
+      header: "Question",
+      question: "Which database?",
+      options: [
+        { label: "Postgres", description: "" },
+        { label: "SQLite", description: "" },
+      ],
+    })
+    expect(bridged.respond(["SQLite"])).toBe("opt_sqlite")
+    expect(bridged.respond(["something typed"])).toBeUndefined()
+    expect(bridged.respond(undefined)).toBeUndefined()
+  })
+
+  test("an unavailable question cancels instead of approving", async () => {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
+    const s = (bridge as any).getOrCreateSession("ses-interaction")
+    const outcome = await (bridge as any).handlePermissionRequest(s, {
+      toolCall: { toolCallId: "interaction_2", title: "Pick" },
+      options: [{ optionId: "a", name: "A", kind: "allow_once" }],
+    })
+    expect(outcome).toEqual({ outcome: "cancelled" })
+    await bridge.disposeAll()
+  })
+
+  test("counts agy's cached tokens into the input total", async () => {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: () =>
+        ({
+          isClosed: false,
+          initialize: async () => ({}),
+          authenticate: async () => ({}),
+          newSession: async () => ({ sessionId: "acp-usage-agy" }),
+          setModel: async () => {},
+          setMode: async () => {},
+          notifyCancel: () => {},
+          dispose: async () => {},
+          prompt: async () => ({
+            stopReason: "end_turn",
+            usage: {
+              inputTokens: 16513,
+              outputTokens: 442,
+              cachedReadTokens: 23081,
+              cachedWriteTokens: 0,
+              thoughtTokens: 300,
+              totalTokens: 40036,
+            },
+          }),
+        }) as any,
+    })
+    try {
+      const { stream } = await bridge.createLanguageModel("gemini-4-neon").doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        headers: { "x-opencode-session-id": "ses-usage-agy" },
+      } as any)
+      const finish = (await readAllParts(stream)).find((p) => p.type === "finish")
+      expect(finish.usage.inputTokens).toEqual({ total: 39594, noCache: 16513, cacheRead: 23081, cacheWrite: 0 })
+      expect(finish.usage.outputTokens).toEqual({ total: 442, text: 142, reasoning: 300 })
+    } finally {
+      await bridge.disposeAll()
+    }
+  })
+
+  test("a refusal stop reason trips only that model pool's cooldown", async () => {
+    resetSharedCatalogForTests()
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: () =>
+        ({
+          isClosed: false,
+          initialize: async () => ({}),
+          authenticate: async () => ({}),
+          newSession: async () => ({ sessionId: "acp-refusal" }),
+          setModel: async () => {},
+          setMode: async () => {},
+          notifyCancel: () => {},
+          dispose: async () => {},
+          prompt: async () => ({ stopReason: "refusal" }),
+        }) as any,
+    })
+    try {
+      const { stream } = await bridge.createLanguageModel("gemini-4-neon").doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        headers: { "x-opencode-session-id": "ses-refusal" },
+      } as any)
+      const parts = await readAllParts(stream)
+      expect(parts.some((p) => p.type === "error")).toBe(false)
+      expect(parts.find((p) => p.type === "finish")?.finishReason?.raw).toBe("quota_cooldown")
+      expect((bridge as any).cooldownForModel("gemini-4-neon")).toBeDefined()
+      expect((bridge as any).cooldownForModel("claude-sonnet-5-5")).toBeUndefined()
+    } finally {
+      await bridge.disposeAll()
+    }
+  })
+
+  test("syncs the mode when agy reports a mode change", () => {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
+    const s = (bridge as any).getOrCreateSession("ses-mode")
+    ;(bridge as any).handleAcpUpdate(s, { sessionUpdate: "current_mode_update", currentModeId: "plan" })
+    expect(bridge.getState("ses-mode").mode).toBe("plan")
+    ;(bridge as any).handleAcpUpdate(s, { sessionUpdate: "current_mode_update", currentModeId: "bogus" })
+    expect(bridge.getState("ses-mode").mode).toBe("plan")
   })
 })
 
@@ -301,7 +602,7 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
     expect(midTurnParts.some((p) => p.type === "error")).toBe(false)
     expect(midTurnParts.find((p) => p.type === "tool-result")).toMatchObject({
       toolCallId: "native-1",
-      toolName: "acp_run_command",
+      toolName: "antigravity.shell",
       result: { status: "unknown" },
       isError: true,
     })

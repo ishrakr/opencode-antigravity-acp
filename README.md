@@ -1,7 +1,7 @@
 # opencode-antigravity-acp
 
-[![npm](https://img.shields.io/npm/v/opencode-antigravity-acp.svg)](https://www.npmjs.com/package/opencode-antigravity-acp)
-[![CI](https://github.com/system1970/opencode-antigravity-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/system1970/opencode-antigravity-acp/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@ishrakr/opencode-antigravity-acp.svg)](https://www.npmjs.com/package/@ishrakr/opencode-antigravity-acp)
+[![CI](https://github.com/ishrakr/opencode-antigravity-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/ishrakr/opencode-antigravity-acp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 Use your **Antigravity subscription models** inside **OpenCode Desktop & CLI** through Google's official local `agy acp` stdio protocol — seamless cross-model & same-process model switching via plain-text-only handoff, Code Mode by default, with Pure ACP opt-out.
@@ -49,7 +49,7 @@ This plugin follows the same official-harness architecture used by tools like **
 ## Features
 
 - **Seamless cross-model & fast same-process switching (T3-Code-style `create_with_handoff`):** switch freely between Antigravity ACP and normal OpenCode models—or between different Antigravity models on the same `agy acp` process—in the same session with no lock-outs and no lost context. Normal ACP-to-ACP flow sends ONLY the raw latest human prompt + image attachments via `buildThinAcpPromptBlocks`. Switching models or returning from normal-model turns starts a fresh `agy acp` session (`session/new`) and restores the earlier conversation via a plain-text-only handoff (`buildTextOnlyHandoffPromptBlocks`: ONLY `[Historical user]` / `[Historical assistant]` text, 16k cap, dropping all reasoning, tool calls, tool results, schemas, todos, approvals) followed by the latest prompt. No tool/reasoning replay, ever. Toggling ACP modes reconnects automatically with the same seamless restore.
-- **Code Mode by default + Pure ACP opt-out:** attaches only the single `oc` Code Mode MCP server (`execute`, `subagent`, etc.) with zero prompt injection (switch via the ACP popover: `+ Code Mode` vs `Pure ACP`), and preserves native `acp_*` tool call names in tool results. Pure ACP opt-out uses `mcpServers: []` (zero bridged MCPs, 100% native `agy acp`).
+- **Code Mode by default + Pure ACP opt-out:** attaches only the single `oc` Code Mode MCP server (`execute`, `subagent`, etc.) with zero prompt injection (switch via the ACP popover: `+ Code Mode` vs `Pure ACP`), and shows agy's own tools the way OpenCode shows its tools: they are named `antigravity.read`, `antigravity.edit`, `antigravity.write`, `antigravity.shell` (and so on) with OpenCode-style inputs, edits come back as unified diffs and commands as their output and exit code, so OpenCode and OpenChamber render file paths, diffs and command output. Pure ACP opt-out uses `mcpServers: []` (zero bridged MCPs, 100% native `agy acp`).
 - **Accurate token & context usage reporting:** tracks live `usage_update` context size and per-turn token usage (preserving usage on interrupts and isolating turns cleanly).
 - **Robust process & session lifecycle:** process-group teardown, stdio guards, prompt deadlines and `AbortSignal` cancellation, plus session-scoped cleanup when OpenCode sessions are deleted.
 - **Explicit ACP `authenticate()` + oauth env scrub:** after `initialize`, the bridge calls official `authenticate` (`oauth-personal` by default, `gemini-api-key` when `GEMINI_API_KEY` is set, or `ANTIGRAVITY_ACP_AUTH_METHOD` override), ignoring benign already-authenticated errors. When spawning `agy acp` for `oauth-personal`, ambient `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `GOOGLE_APPLICATION_CREDENTIALS` are scrubbed so stray keys never collide with the personal login (kept for `gemini-api-key` / `agent-platform`).
@@ -90,18 +90,18 @@ This plugin follows the same official-harness architecture used by tools like **
 ### Option 1: Install via OpenCode CLI (Recommended)
 
 ```bash
-opencode plugin add opencode-antigravity-acp
+opencode plugin add @ishrakr/opencode-antigravity-acp
 opencode service restart
 ```
 
-*(You can also install directly from GitHub via `opencode plugin add github:system1970/opencode-antigravity-acp`.)*
+*(You can also install directly from GitHub via `opencode plugin add github:ishrakr/opencode-antigravity-acp`.)*
 
 ### Option 2: Clone into OpenCode's Auto-Discovered Plugin Folder
 
 OpenCode v2 automatically discovers local plugins placed under `~/.config/opencode/plugins/` (no build step required — the compiled `dist/gui-experimental.cjs` bundle is included):
 
 ```bash
-git clone https://github.com/system1970/opencode-antigravity-acp ~/.config/opencode/plugins/opencode-antigravity-acp
+git clone https://github.com/ishrakr/opencode-antigravity-acp ~/.config/opencode/plugins/opencode-antigravity-acp
 opencode service restart
 ```
 
@@ -124,6 +124,12 @@ When an **Antigravity (ACP)** model is active, an **`ACP`** pill appears above t
 - **Actions & Slash commands:**
   - `/agy-reset` — Disposes and resets the active Antigravity ACP session for the current session (background command).
   - `/agy-reload` — Forces live model & reasoning-effort discovery from `agy acp` and reloads providers.
+
+---
+
+## Quota in OpenChamber
+
+[`openchamber-quota/`](./openchamber-quota) is an OpenChamber extension that shows your Antigravity 5-hour and weekly limits per model group on OpenChamber's Usage page and in the header. It reads them from `agy`'s own `/quota` command, using your existing `agy` login. Add the folder in **Settings → Extensions**.
 
 ---
 

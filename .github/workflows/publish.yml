@@ -25,7 +25,7 @@ jobs:
           # in the npm package settings (one-time manual step).
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
-      - run: bun test
+      - run: bun run test
       - run: bun run build
       - name: Tag must match package.json version
         run: |

@@ -16,5 +16,13 @@ jobs:
           bun-version: latest
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
-      - run: bun test
+      - run: bun run test
       - run: bun run build
+      - name: OpenChamber quota extension
+        working-directory: openchamber-quota
+        run: |
+          bun install --frozen-lockfile
+          bun x tsc --noEmit
+          bun run test
+          bun run build
+          git diff --exit-code -- service/main.js

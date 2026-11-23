@@ -33,9 +33,12 @@ import {
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
 import { McpRelayServer, type McpCallToolResult, type McpToolDescriptor } from "./mcp-relay.js"
+import { describeAcpToolCall, describeAcpToolResult } from "./tool-display.js"
 import {
   elicitationToQuestions,
+  isAcpUserInputRequest,
   parseQuestionToolAnswers,
+  permissionToQuestion,
   type OpenCodeQuestion,
 } from "./question-bridge.js"
 
@@ -43,6 +46,8 @@ import {
 const OPENCODE_QUESTION_TOOL = "question"
 
 export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
+
+const ACP_MODES = new Set<AcpMode>(["auto", "accept-edits", "default", "plan"])
 
 class PluginDisposedError extends Error {
   constructor() {
@@ -296,6 +301,31 @@ function buildUsage(
     activeContextUsed > 0
       ? activeContextUsed
       : undefined
+  // agy reports inputTokens without the cached part: its totalTokens is
+  // input + cachedRead + cachedWrite + output. Detect that shape from the
+  // total and count cached tokens into the input, as the AI SDK expects.
+  const cachedSum = (rawCacheRead ?? 0) + (rawCacheWrite ?? 0)
+  if (
+    rawInput !== undefined &&
+    rawOutput !== undefined &&
+    rawTotal !== undefined &&
+    cachedSum > 0 &&
+    rawTotal === rawInput + cachedSum + rawOutput
+  ) {
+    return {
+      inputTokens: {
+        total: rawInput + cachedSum,
+        noCache: rawInput,
+        cacheRead: rawCacheRead,
+        cacheWrite: rawCacheWrite,
+      },
+      outputTokens: {
+        total: rawOutput,
+        text: Math.max(0, rawOutput - (reasoning ?? 0)),
+        reasoning,
+      },
+    }
+  }
   const inputTotal = rawInput ?? derivedInputFromTotal ?? fallbackContext
   const cacheRead =
     rawCacheRead !== undefined && inputTotal !== undefined
@@ -383,23 +413,6 @@ function acpToolsSignatureFor(s: BridgeSession): string {
   const snap = s.contextSnapshot
   if (!snap) return "code:__missing__"
   return `code:${snap.toolSignature}`
-}
-
-function extractToolContentText(update: AcpSessionUpdate): unknown {
-  if (update.rawOutput !== undefined) return update.rawOutput
-  if (Array.isArray(update.content)) {
-    const texts: string[] = []
-    for (const block of update.content as any[]) {
-      if (block?.type === "text" && typeof block.text === "string") texts.push(block.text)
-      else if (block?.content?.type === "text" && typeof block.content.text === "string") {
-        texts.push(block.content.text)
-      } else {
-        texts.push(JSON.stringify(block))
-      }
-    }
-    if (texts.length > 0) return texts.join("\n")
-  }
-  return { status: update.status ?? "completed", title: update.title }
 }
 
 export class SessionBridgeManager {
@@ -1682,6 +1695,12 @@ export class SessionBridgeManager {
       (o) => o.kind === "reject_once" || o.kind === "reject_always" || o.optionId.includes("deny"),
     )
 
+    // agy sends its native multiple-choice questions through the permission
+    // method; their options are answers, never approvals.
+    if (isAcpUserInputRequest(params)) {
+      return this.askNativeChoiceQuestion(s, params)
+    }
+
     const toolName = String(params.toolCall?.name ?? params.toolCall?.kind ?? "unknown")
     // Always allow the internal MCP relay inside ACP: OpenCode itself enforces real permissions when running the tool!
     if (toolName.startsWith("mcp_oc_")) {
@@ -1757,6 +1776,24 @@ export class SessionBridgeManager {
       return { action: "cancel" }
     }
     return { action: "accept", content }
+  }
+
+  private async askNativeChoiceQuestion(
+    s: BridgeSession,
+    params: AcpPermissionRequestParams,
+  ): Promise<AcpPermissionOutcome> {
+    const bridged = permissionToQuestion(params)
+    if (!bridged) {
+      this.diag(s, "question bridge: unsupported native choice question")
+      return { outcome: "cancelled" }
+    }
+    const answers = await this.askOpenCodeQuestions(s, [bridged.question], params.toolCall?.toolCallId)
+    const optionId = bridged.respond(answers?.[0])
+    if (!optionId) {
+      this.diag(s, "question bridge: native choice question cancelled or unanswered")
+      return { outcome: "cancelled" }
+    }
+    return { outcome: "selected", optionId }
   }
 
   /** Non-fatal diagnostic for the question bridge; never surfaces as an error. */
@@ -2065,6 +2102,16 @@ export class SessionBridgeManager {
       return
     }
 
+    if (kind === "current_mode_update") {
+      const modeId = String(update.currentModeId ?? "")
+      if (ACP_MODES.has(modeId as AcpMode) && s.mode !== modeId) {
+        s.mode = modeId as AcpMode
+        s.lastModeApplied = s.mode
+        this.notifyChanged(s.sessionID)
+      }
+      return
+    }
+
     if (kind === "usage_update") {
       if (typeof update.used === "number" && Number.isFinite(update.used) && update.used >= 0) {
         s.lastContextUsed = update.used
@@ -2201,11 +2248,15 @@ export class SessionBridgeManager {
         if (kind !== "tool_call") return
 
         this.closeOpenBlocks(turn)
-        displayName = `acp_${name}`
+        const display = describeAcpToolCall(update)
+        displayName = display.name
         turn.activeNativeTools.set(callId, displayName)
         const rawInput = update.rawInput ?? update.args ?? {}
-        const jsonInput = JSON.stringify(rawInput)
-        ;(turn.nativeToolText ??= new Map()).set(callId, `${name}\n${update.title ?? ""}\n${jsonInput}`)
+        const jsonInput = JSON.stringify(display.input)
+        ;(turn.nativeToolText ??= new Map()).set(
+          callId,
+          `${name}\n${update.title ?? ""}\n${JSON.stringify(rawInput)}`,
+        )
         this.emitPart(turn, {
           type: "tool-input-start",
           id: callId,
@@ -2234,7 +2285,7 @@ export class SessionBridgeManager {
       if (status === "completed" || status === "failed" || status === "error" || status === "cancelled") {
         turn.activeNativeTools.delete(callId)
         const isError = status !== "completed"
-        const resultPayload = extractToolContentText(update)
+        const resultPayload = describeAcpToolResult(update, s.cwd)
         this.emitPart(turn, {
           type: "tool-result",
           toolCallId: callId,
@@ -2723,6 +2774,22 @@ export class SessionBridgeManager {
               if (turn.abortedOnApiError || bridge.disposed) return
               turn.promptSettled = true
               turn.promptResult = res
+              // agy reports an exhausted model quota as the `refusal` stop
+              // reason: cool down that quota pool like a quota error message.
+              if (res?.stopReason === "refusal") {
+                turn.abortedOnApiError = true
+                const bucket = quotaBucketForModel(s.lastModelId ?? modelID)
+                const rec = bridge.tripCircuitBreaker("quota exhausted (stop reason: refusal)", bucket)
+                s.lastError = rec.reason
+                bridge.finishTurnCleanStop(
+                  s,
+                  turn,
+                  `Antigravity ACP stopped this turn: the ${bucket} model quota is exhausted (60s cooldown for this model pool; other pools are unaffected, switch models to continue).`,
+                  "quota_cooldown",
+                )
+                bridge.notifyChanged(sessionID)
+                return
+              }
               s.lastError = null
               if (turn.flushTimer) {
                 clearTimeout(turn.flushTimer)

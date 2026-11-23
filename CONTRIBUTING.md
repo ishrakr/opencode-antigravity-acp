@@ -7,7 +7,7 @@ Thanks for your interest in contributing!
 1. Clone the repository and install dependencies with [Bun](https://bun.sh):
 
    ```bash
-   git clone https://github.com/system1970/opencode-antigravity-acp.git
+   git clone https://github.com/ishrakr/opencode-antigravity-acp.git
    cd opencode-antigravity-acp
    bun install
    ```

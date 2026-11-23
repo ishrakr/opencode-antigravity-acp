@@ -3,6 +3,7 @@ import type {
   LanguageModelV3ToolResultOutput,
 } from "@ai-sdk/provider"
 import type { AcpContentBlock } from "./acp-client.js"
+import { isAcpToolName } from "./tool-display.js"
 
 export const ACP_PROVIDER_ID = "antigravity-acp"
 
@@ -86,7 +87,7 @@ export function sanitizeForNonAcpModel(messages: any[]): void {
           (part.type === "tool-call" || part.type === "tool-result") &&
           part.providerExecuted === true &&
           (Boolean(part.providerMetadata?.[ACP_PROVIDER_ID]) ||
-            String(part.name ?? "").startsWith("acp_"))
+            isAcpToolName(part.name))
 
         if (isAcpHosted) {
           changed = true

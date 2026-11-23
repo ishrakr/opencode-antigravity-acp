@@ -1,4 +1,4 @@
-import type { AcpElicitationRequestParams } from "./acp-client.js"
+import type { AcpElicitationRequestParams, AcpPermissionRequestParams } from "./acp-client.js"
 
 /**
  * Bridges Antigravity questions (`ask_question`) to OpenCode's native
@@ -140,6 +140,51 @@ export function elicitationToQuestions(params: AcpElicitationRequestParams): Bri
       })
       // Nothing answered (dismissed or empty form): cancel, don't accept {}.
       return answered ? content : undefined
+    },
+  }
+}
+
+/**
+ * agy sends some native questions through `session/request_permission`
+ * with a tool call ID starting `interaction_`; their options are answers.
+ */
+export function isAcpUserInputRequest(params: AcpPermissionRequestParams): boolean {
+  return String(params.toolCall?.toolCallId ?? "").startsWith("interaction_")
+}
+
+export interface BridgedChoiceQuestion {
+  readonly question: OpenCodeQuestion
+  /** The optionId for the chosen label, or `undefined` when unanswered. */
+  readonly respond: (answer: readonly string[] | undefined) => string | undefined
+}
+
+/** Converts a native choice question into one single-choice OpenCode question. */
+export function permissionToQuestion(params: AcpPermissionRequestParams): BridgedChoiceQuestion | undefined {
+  const options = params.options ?? []
+  if (options.length === 0) return undefined
+  const seen = new Set<string>()
+  const choices: Choice[] = []
+  for (const option of options) {
+    const id = option.optionId?.trim()
+    if (!id || choices.some((c) => c.value === option.optionId)) return undefined
+    const label = nonEmpty(option.name) ?? id
+    let unique = label
+    for (let n = 2; seen.has(unique); n++) unique = `${label} (${n})`
+    seen.add(unique)
+    choices.push({ label: unique, value: option.optionId })
+  }
+  return {
+    question: {
+      header: "Question",
+      question: nonEmpty(params.toolCall?.title) ?? "Choose an option.",
+      options: choices.map((c) => ({ label: c.label, description: "" })),
+    },
+    respond: (answer) => {
+      for (const entry of answer ?? []) {
+        const choice = choices.find((c) => c.label === entry)
+        if (choice) return choice.value
+      }
+      return undefined
     },
   }
 }
