@@ -34,7 +34,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "vite build",
+    "build:gui": "vite build",
     "test": "bun test ./test",
     "typecheck": "tsc --noEmit"
   },

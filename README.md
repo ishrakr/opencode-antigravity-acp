@@ -139,7 +139,7 @@ When an **Antigravity (ACP)** model is active, an **`ACP`** pill appears above t
 bun install
 bun run typecheck
 bun test
-bun run build
+bun run build:gui
 ```
 
 ## Contributing & Security
