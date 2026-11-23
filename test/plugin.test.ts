@@ -29,6 +29,7 @@ import {
   stripUnsafeInternalLines,
 } from "../src/history-sanitizer.js"
 import { McpRelayServer } from "../src/mcp-relay.js"
+import { elicitationToQuestions, parseQuestionToolAnswers } from "../src/question-bridge.js"
 import {
   SessionBridgeManager,
   quotaBucketForModel,
@@ -2707,5 +2708,274 @@ describe("Token/context window usage reporting", () => {
     expect(finish?.finishReason?.raw).toBe("quota_cooldown")
     expect(finish?.usage.inputTokens.total).toBe(7777)
     await bridge.disposeAll()
+  })
+})
+
+describe("Antigravity questions via OpenCode's question tool", () => {
+  afterEach(() => {
+    resetSharedCatalogForTests()
+  })
+
+  // Captured from `agy acp` 1.5.13 (single + multi-select), plus a free-form
+  // question and Go's lexicographic key order.
+  const agyForm = {
+    mode: "form",
+    message: "The agent has 3 questions.",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        q1: {
+          type: "string",
+          title: "What is your favorite color?",
+          oneOf: [
+            { const: "1", title: "(Recommended) Blue" },
+            { const: "2", title: "Red" },
+          ],
+        },
+        q1_other: { type: "string", title: "Other", description: "Optional free-form answer to: What is your favorite color?" },
+        q10_other: { type: "string", title: "Anything else?" },
+        q2: {
+          type: "array",
+          title: "Which pets?",
+          items: {
+            anyOf: [
+              { const: "1", title: "Cat" },
+              { const: "2", title: "Dog, small" },
+            ],
+          },
+        },
+        q2_other: { type: "string", title: "Other", description: "Optional free-form answer to: Which pets?" },
+      },
+    },
+  }
+
+  test("maps agy ask_question forms to OpenCode questions and answers back", () => {
+    const bridged = elicitationToQuestions(agyForm)!
+    expect(bridged.questions).toEqual([
+      {
+        header: "Question 1",
+        question: "What is your favorite color?",
+        options: [
+          { label: "(Recommended) Blue", description: "" },
+          { label: "Red", description: "" },
+        ],
+      },
+      {
+        header: "Question 2",
+        question: "Which pets?",
+        options: [
+          { label: "Cat", description: "" },
+          { label: "Dog, small", description: "" },
+        ],
+        multiple: true,
+      },
+      { header: "Question 3", question: "Anything else?", options: [] },
+    ])
+    expect(bridged.respond([["Red"], ["Cat", "Dog, small", "a fish"], ["no"]])).toEqual({
+      q1: "2",
+      q2: ["1", "2"],
+      q2_other: "a fish",
+      q10_other: "no",
+    })
+    // OpenCode semantics: typed text replaces a single choice.
+    expect(bridged.respond([["Purple"], [], []])).toEqual({ q1_other: "Purple" })
+  })
+
+  test("declines forms it cannot ask", () => {
+    expect(elicitationToQuestions({ mode: "url", url: "https://example.com" })).toBeUndefined()
+    expect(
+      elicitationToQuestions({ requestedSchema: { type: "object", properties: { x: { type: "object" } } } }),
+    ).toBeUndefined()
+  })
+
+  test("parses OpenCode question tool output with labels that contain commas", () => {
+    const questions = elicitationToQuestions(agyForm)!.questions
+    const text =
+      'User has answered your questions: "What is your favorite color?"="Unanswered", ' +
+      '"Which pets?"="Dog, small, a fish, really", "Anything else?"="yes, \\"quoted\\"". ' +
+      "You can now continue with the user's answers in mind."
+    expect(parseQuestionToolAnswers(text, questions)).toEqual([[], ["Dog, small", "a fish, really"], ['yes, \\"quoted\\"']])
+    expect(parseQuestionToolAnswers("something else", questions)).toBeUndefined()
+  })
+
+  function makeQuestionBridge(
+    withQuestionTool = true,
+    beforeAsk?: (onUpdate: (sid: string, update: AcpSessionUpdate) => void, sid: string) => void,
+  ) {
+    const responses: any[] = []
+    let releasePrompt!: () => void
+    const promptDone = new Promise<void>((r) => (releasePrompt = r))
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      createProc: ({ onUpdate, onElicitation }) =>
+        ({
+          isClosed: false,
+          initialize: async () => ({}),
+          authenticate: async () => ({}),
+          newSession: async () => ({ sessionId: "acp-question" }),
+          setModel: async () => {},
+          setMode: async () => {},
+          notifyCancel: () => {},
+          cancel: async () => {},
+          closeSession: async () => {},
+          dispose: async () => {},
+          prompt: async (sessionId: string) => {
+            if (beforeAsk) beforeAsk(onUpdate!, sessionId)
+            else
+              onUpdate?.(sessionId, {
+                sessionUpdate: "tool_call",
+                toolCallId: "ask",
+                kind: "other",
+                status: "in_progress",
+                rawInput: { questions: [{ question: "What is your favorite color?" }] },
+              })
+            responses.push(await onElicitation!(agyForm))
+            onUpdate?.(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "ask", status: "completed" })
+            onUpdate?.(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Thanks" } })
+            releasePrompt()
+            return { stopReason: "end_turn" }
+          },
+        }) as any,
+    })
+    const SESSION = "ses-question"
+    bridge.updateContextSnapshot(SESSION, {
+      systemText: "",
+      agent: "build",
+      tools: withQuestionTool ? { question: { description: "Ask", input: {} } } : {},
+    })
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const headers = { "x-opencode-session-id": SESSION }
+    const user = { role: "user", content: [{ type: "text", text: "Ask me" }] }
+    return { bridge, lm, headers, user, responses, promptDone }
+  }
+
+  test("asks through OpenCode's question tool and answers the elicitation", async () => {
+    const { bridge, lm, headers, user, responses } = makeQuestionBridge()
+    const first = await readAllParts((await lm.doStream({ prompt: [user], headers } as any)).stream)
+
+    // agy's own open ask_question call is closed so the question can be dispatched.
+    expect(first.find((p) => p.type === "tool-result")).toMatchObject({ toolCallId: "ask", isError: false })
+    const call = first.find((p) => p.type === "tool-call" && p.toolName === "question")
+    expect(JSON.parse(call.input).questions).toHaveLength(3)
+    expect(first.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+
+    const output =
+      'User has answered your questions: "What is your favorite color?"="(Recommended) Blue", ' +
+      '"Which pets?"="Cat", "Anything else?"="Unanswered". You can now continue with the user\'s answers in mind.'
+    const second = await readAllParts(
+      (
+        await lm.doStream({
+          prompt: [
+            user,
+            { role: "assistant", content: [{ type: "tool-call", toolCallId: call.toolCallId, toolName: "question", input: {} }] },
+            {
+              role: "tool",
+              content: [{ type: "tool-result", toolCallId: call.toolCallId, toolName: "question", output: { type: "text", value: output } }],
+            },
+          ],
+          headers,
+        } as any)
+      ).stream,
+    )
+
+    expect(responses).toEqual([{ action: "accept", content: { q1: "1", q2: ["1"] } }])
+    // Updates for agy's settled ask_question call are ignored.
+    expect(second.filter((p) => p.type === "tool-result")).toHaveLength(0)
+    expect(second.find((p) => p.type === "text-delta")?.delta).toBe("Thanks")
+    await bridge.disposeAll()
+  })
+
+  test("closes only agy's ask_question call and waits for other running tools", async () => {
+    const { bridge, lm, headers, user } = makeQuestionBridge(true, (onUpdate, sid) => {
+      onUpdate(sid, {
+        sessionUpdate: "tool_call",
+        toolCallId: "ask",
+        kind: "other",
+        status: "in_progress",
+        rawInput: { questions: [{ question: "What is your favorite color?" }] },
+      })
+      // Opened after ask_question, so "newest open call" alone would pick it.
+      onUpdate(sid, { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "in_progress" })
+      setTimeout(() => {
+        onUpdate(sid, { sessionUpdate: "tool_call_update", toolCallId: "run", status: "completed", rawOutput: "done" })
+      }, 100)
+    })
+    const parts = await readAllParts((await lm.doStream({ prompt: [user], headers } as any)).stream)
+    const results = parts.filter((p) => p.type === "tool-result")
+    expect(results.map((p) => [p.toolCallId, p.isError])).toEqual([
+      ["ask", false],
+      ["run", false],
+    ])
+    expect(results[1].result).toBe("done")
+    // The question is dispatched only after the other tool finished.
+    const questionIndex = parts.findIndex((p) => p.type === "tool-call" && p.toolName === "question")
+    expect(questionIndex).toBeGreaterThan(parts.indexOf(results[1]))
+    await bridge.handleInterrupt("ses-question")
+    await bridge.disposeAll()
+  })
+
+  test("cancels when the user dismisses the question", async () => {
+    const { bridge, lm, headers, user, responses } = makeQuestionBridge()
+    const first = await readAllParts((await lm.doStream({ prompt: [user], headers } as any)).stream)
+    const call = first.find((p) => p.type === "tool-call" && p.toolName === "question")
+    await readAllParts(
+      (
+        await lm.doStream({
+          prompt: [
+            user,
+            {
+              role: "tool",
+              content: [
+                { type: "tool-result", toolCallId: call.toolCallId, toolName: "question", output: { type: "error-text", value: "dismissed" } },
+              ],
+            },
+          ],
+          headers,
+        } as any)
+      ).stream,
+    )
+    expect(responses).toEqual([{ action: "cancel" }])
+    await bridge.disposeAll()
+  })
+
+  test("cancels without asking when the question tool is unavailable", async () => {
+    const { bridge, lm, headers, user, responses, promptDone } = makeQuestionBridge(false)
+    const parts = await readAllParts((await lm.doStream({ prompt: [user], headers } as any)).stream)
+    await promptDone
+    expect(parts.find((p) => p.type === "tool-call" && p.toolName === "question")).toBeUndefined()
+    expect(responses).toEqual([{ action: "cancel" }])
+    await bridge.disposeAll()
+  })
+
+  test("never settles an unrelated native tool when the elicitation arrives first", async () => {
+    // Elicitation arrives before agy's ask_question tool_call update, so only
+    // an unrelated running tool is visible. The bridge must not fabricate that
+    // tool's result; the question is still asked.
+    const { bridge, lm, headers, user, responses } = makeQuestionBridge(true, (onUpdate, sid) => {
+      onUpdate(sid, { sessionUpdate: "tool_call", toolCallId: "run", name: "run_command", status: "in_progress" })
+    })
+    const parts = await readAllParts((await lm.doStream({ prompt: [user], headers } as any)).stream)
+    expect(parts.find((p) => p.type === "tool-call" && p.toolName === "question")).toBeDefined()
+    expect(parts.find((p) => p.type === "tool-result" && p.toolCallId === "run")).toBeUndefined()
+    await bridge.disposeAll()
+    // Never answered: the elicitation is cancelled, not invented.
+    expect(responses).toEqual([{ action: "cancel" }])
+  })
+
+  test("parses answers when a question title contains quotes", async () => {
+    const { parseQuestionToolAnswers } = await import("../src/question-bridge.js")
+    const questions = [
+      { header: "Q", question: 'What does "foo" mean?', options: [{ label: "A", description: "" }] },
+      { header: "Q", question: "Second?", options: [{ label: "B", description: "" }] },
+    ]
+    const text =
+      'User has answered your questions: "What does "foo" mean?"="A", "Second?"="B". ' +
+      "You can now continue with the user's answers in mind."
+    expect(parseQuestionToolAnswers(text, questions)).toEqual([["A"], ["B"]])
+  })
+
+  test("respond refuses to accept an empty answer set", async () => {
+    const { elicitationToQuestions } = await import("../src/question-bridge.js")
+    const bridged = elicitationToQuestions(agyForm)!
+    expect(bridged.respond([[], [], []])).toBeUndefined()
   })
 })

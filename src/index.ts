@@ -128,8 +128,10 @@ export default Plugin.define({
             // when + Code Mode is enabled, OpenCode needs `input.tools` intact
             // so `mcp_oc_*` tool-call round-trips (e.g. `execute`) are permitted
             // (our `doStream` ignores `options.tools` and never injects schemas).
+            // Pure ACP still keeps `question` so agy's ask_question can be answered.
             if (!bridge.getState(input.sessionID).codeModeEnabled) {
-              input.tools = {}
+              const question = input.tools.question
+              input.tools = question ? { question } : {}
             }
           } else {
             sanitizeForNonAcpModel(input.messages as any[])

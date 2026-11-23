@@ -104,6 +104,20 @@ export interface AcpPermissionRequestParams {
   readonly options?: ReadonlyArray<AcpPermissionOption>
 }
 
+export interface AcpElicitationRequestParams {
+  readonly sessionId?: string
+  readonly mode?: string
+  readonly message?: string
+  readonly requestedSchema?: unknown
+  readonly toolCallId?: string
+  readonly [key: string]: unknown
+}
+
+export type AcpElicitationResponse =
+  | { readonly action: "accept"; readonly content: Record<string, unknown> }
+  | { readonly action: "decline" }
+  | { readonly action: "cancel" }
+
 export type AcpPermissionOutcome =
   | { readonly outcome: "selected"; readonly optionId: string }
   | { readonly outcome: "cancelled" }
@@ -369,6 +383,8 @@ export interface AcpProcessOptions {
   readonly onPermissionRequest?: (
     params: AcpPermissionRequestParams,
   ) => Promise<AcpPermissionOutcome>
+  /** Answers form elicitations such as `ask_question`. Without it, forms are declined. */
+  readonly onElicitation?: (params: AcpElicitationRequestParams) => Promise<AcpElicitationResponse>
   readonly onExit?: (code: number | null, signal: NodeJS.Signals | null, stderrTail: string) => void
   readonly onLog?: (level: "warn" | "debug", message: string, meta?: Record<string, unknown>) => void
 }
@@ -695,6 +711,22 @@ export class AcpProcess {
       return
     }
 
+    if (method === "elicitation/create") {
+      let result: AcpElicitationResponse
+      try {
+        result = this.options.onElicitation
+          ? await this.options.onElicitation((params ?? {}) as AcpElicitationRequestParams)
+          : { action: "decline" }
+      } catch (err) {
+        this.options.onLog?.("warn", "onElicitation failed; cancelling", {
+          error: err instanceof Error ? err.message : String(err),
+        })
+        result = { action: "cancel" }
+      }
+      this.write({ jsonrpc: "2.0", id, result })
+      return
+    }
+
     this.write({
       jsonrpc: "2.0",
       id,
@@ -808,7 +840,9 @@ export class AcpProcess {
       "initialize",
       {
         protocolVersion: 1,
-        clientCapabilities: {},
+        // Form elicitation makes agy send `ask_question` as `elicitation/create`,
+        // which supports multiple questions, multi-select and typed answers.
+        clientCapabilities: { elicitation: { form: {} } },
         clientInfo: { name: "acp-bridge", version: "0.2.2" },
       },
       15_000,

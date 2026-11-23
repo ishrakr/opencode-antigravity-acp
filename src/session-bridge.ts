@@ -15,6 +15,8 @@ import {
   discoverAcpModels,
   resolveAcpModelTarget,
   type AcpDiscoveredModel,
+  type AcpElicitationRequestParams,
+  type AcpElicitationResponse,
   type AcpPermissionOutcome,
   type AcpPermissionRequestParams,
   type AcpProcessOptions,
@@ -31,6 +33,14 @@ import {
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
 import { McpRelayServer, type McpCallToolResult, type McpToolDescriptor } from "./mcp-relay.js"
+import {
+  elicitationToQuestions,
+  parseQuestionToolAnswers,
+  type OpenCodeQuestion,
+} from "./question-bridge.js"
+
+/** OpenCode's built-in tool that asks the user questions. */
+const OPENCODE_QUESTION_TOOL = "question"
 
 export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
 
@@ -66,6 +76,8 @@ const NATIVE_SHADOWED_TOOLS = new Set([
   "glob",
   "ls",
   "list",
+  // agy's own ask_question is bridged to this tool, so don't offer it twice.
+  OPENCODE_QUESTION_TOOL,
 ])
 
 export interface SessionContextSnapshot {
@@ -100,6 +112,14 @@ interface PendingMcpCall {
   resolved: boolean
   readonly resolve: (res: McpCallToolResult) => void
   abortCleanup?: () => void
+  /** agy's own pending ask_question call, closed when the question is shown. */
+  readonly nativeToolCallId?: string
+  /**
+   * Question relayed to OpenCode while agy's own ask_question call could not
+   * be identified: flush even if other native tools are still open, so the
+   * user is actually asked instead of the turn hanging.
+   */
+  readonly bypassNativeTools?: boolean
 }
 
 interface ActiveTurn {
@@ -110,6 +130,8 @@ interface ActiveTurn {
   openReasoningId?: string
   partSeq: number
   readonly activeNativeTools: Map<string, string>
+  /** Searchable title/name/input of native tool calls, to find agy's ask_question call. */
+  nativeToolText?: Map<string, string>
   readonly relayedUpdateIds: Set<string>
   readonly pendingMcpCalls: Map<string, PendingMcpCall>
   readonly dispatchedCallIds: Set<string>
@@ -756,6 +778,10 @@ export class SessionBridgeManager {
           holder.owner
             ? this.handlePermissionRequest(holder.owner, params)
             : Promise.resolve({ outcome: "cancelled" as const }),
+        onElicitation: (params) =>
+          holder.owner
+            ? this.handleElicitation(holder.owner, params)
+            : Promise.resolve({ action: "decline" as const }),
         onExit: (code, signal, tail) => {
           this.activeProcs.delete(proc)
           const owner = holder.owner
@@ -1419,6 +1445,7 @@ export class SessionBridgeManager {
           dangerouslySkipPermissions: false,
           onUpdate: (_sid, update) => this.handleAcpUpdate(s, update),
           onPermissionRequest: (params) => this.handlePermissionRequest(s, params),
+          onElicitation: (params) => this.handleElicitation(s, params),
           onExit: (code, signal, tail) => {
             this.handleProcExit(s, proc, code, signal, tail, disposedByBridge)
           },
@@ -1702,6 +1729,116 @@ export class SessionBridgeManager {
     }
   }
 
+  private async handleElicitation(
+    s: BridgeSession,
+    params: AcpElicitationRequestParams,
+  ): Promise<AcpElicitationResponse> {
+    let bridged
+    try {
+      bridged = elicitationToQuestions(params)
+    } catch (err) {
+      this.diag(s, "question bridge: failed to translate elicitation", err)
+      return { action: "cancel" }
+    }
+    if (!bridged) {
+      this.diag(s, "question bridge: declined unsupported elicitation form", undefined, {
+        mode: params.mode,
+      })
+      return { action: "decline" }
+    }
+    const answers = await this.askOpenCodeQuestions(s, bridged.questions, params.toolCallId)
+    if (!answers) {
+      this.diag(s, "question bridge: question cancelled or unavailable")
+      return { action: "cancel" }
+    }
+    const content = bridged.respond(answers)
+    if (!content) {
+      this.diag(s, "question bridge: no answers, cancelling elicitation")
+      return { action: "cancel" }
+    }
+    return { action: "accept", content }
+  }
+
+  /** Non-fatal diagnostic for the question bridge; never surfaces as an error. */
+  private diag(
+    s: BridgeSession,
+    message: string,
+    err?: unknown,
+    meta?: Record<string, unknown>,
+  ): void {
+    const detail = err instanceof Error ? err.message : err === undefined ? undefined : String(err)
+    try {
+      console.warn(
+        `[antigravity-acp:${s.sessionID}] ${message}${detail ? ` (${detail})` : ""}`,
+        meta ?? "",
+      )
+    } catch {}
+  }
+
+  /**
+   * Asks through OpenCode's native `question` tool by emitting a tool call in
+   * the active turn, like a relayed MCP call. Resolves with one answer list per
+   * question, or `undefined` when the question is unavailable or dismissed.
+   */
+  private async askOpenCodeQuestions(
+    s: BridgeSession,
+    questions: readonly OpenCodeQuestion[],
+    toolCallIdHint?: string,
+  ): Promise<Array<string[] | undefined> | undefined> {
+    const turn = s.activeTurn
+    if (!turn || !s.contextSnapshot?.tools[OPENCODE_QUESTION_TOOL]) {
+      this.diag(s, "question bridge: OpenCode question tool unavailable")
+      return undefined
+    }
+    const nativeToolCallId = this.findNativeQuestionCall(turn, questions, toolCallIdHint)
+    if (!nativeToolCallId) {
+      this.diag(s, "question bridge: could not identify agy's ask_question call", undefined, {
+        openNativeTools: [...turn.activeNativeTools.keys()].length,
+      })
+    }
+
+    const toolCallId = `oc_question_${++turn.partSeq}_${Math.random().toString(36).slice(2, 8)}`
+    const result = await new Promise<McpCallToolResult>((resolve) => {
+      turn.pendingMcpCalls.set(toolCallId, {
+        toolCallId,
+        mcpName: OPENCODE_QUESTION_TOOL,
+        openCodeToolName: OPENCODE_QUESTION_TOOL,
+        args: { questions },
+        emittedToOpenCode: false,
+        resolved: false,
+        resolve,
+        nativeToolCallId,
+        bypassNativeTools: nativeToolCallId === undefined,
+      })
+      this.scheduleFlushToolCalls(s, turn)
+    })
+    if (result.isError) return undefined
+    const parsed = parseQuestionToolAnswers(result.content.map((c) => c.text).join("\n"), questions)
+    if (!parsed) this.diag(s, "question bridge: could not parse OpenCode answers")
+    return parsed
+  }
+
+  /**
+   * Identifies agy's open ask_question call: the ACP-provided tool call ID,
+   * else the open call whose title/name/input names the question or the
+   * ask_question tool. Never guesses an unrelated tool: settling the wrong
+   * call would fabricate its result and drop its real output.
+   */
+  private findNativeQuestionCall(
+    turn: ActiveTurn,
+    questions: readonly OpenCodeQuestion[],
+    hint?: string,
+  ): string | undefined {
+    if (hint && turn.activeNativeTools.has(hint)) return hint
+    const open = [...turn.activeNativeTools.keys()]
+    const firstQuestion = questions[0]?.question
+    if (firstQuestion) {
+      const byText = open.find((id) => turn.nativeToolText?.get(id)?.includes(firstQuestion))
+      if (byText) return byText
+    }
+    return open.find((id) => /ask_question/i.test(turn.nativeToolText?.get(id) ?? ""))
+  }
+
   private async handleIncomingMcpCall(
     sessionID: string,
     mcpToolName: string,
@@ -1760,13 +1897,27 @@ export class SessionBridgeManager {
 
   private tryFlushToolCalls(s: BridgeSession, turn: ActiveTurn): void {
     if (!turn.controller) return
-    // Wait for any concurrent Antigravity native hosted tool calls to settle first
-    if (turn.activeNativeTools.size > 0) return
-
     const unsent = [...turn.pendingMcpCalls.values()].filter((c) => !c.emittedToOpenCode)
     if (unsent.length === 0) return
 
-    this.closeOpenBlocks(turn)
+    // agy's own ask_question call stays open until it is answered, so close
+    // just that call here (only when it was positively identified); its later
+    // updates are ignored. Text blocks close before the tool-result, matching
+    // the rest of this file's ordering.
+    const settleIds = new Set<string>()
+    for (const call of unsent) {
+      if (call.nativeToolCallId) settleIds.add(call.nativeToolCallId)
+    }
+    const bypass = unsent.some((c) => c.bypassNativeTools)
+    if (settleIds.size > 0) {
+      this.closeOpenBlocks(turn)
+      for (const id of settleIds) this.settleNativeToolForUserInput(turn, id)
+    }
+    // Remaining open native tools block the normal flush. A question with no
+    // identifiable native call may still ask the user, so it is not dropped.
+    if (turn.activeNativeTools.size > 0 && !bypass) return
+    if (settleIds.size === 0) this.closeOpenBlocks(turn)
+
     for (const call of unsent) {
       call.emittedToOpenCode = true
       turn.dispatchedCallIds.add(call.toolCallId)
@@ -2054,6 +2205,7 @@ export class SessionBridgeManager {
         turn.activeNativeTools.set(callId, displayName)
         const rawInput = update.rawInput ?? update.args ?? {}
         const jsonInput = JSON.stringify(rawInput)
+        ;(turn.nativeToolText ??= new Map()).set(callId, `${name}\n${update.title ?? ""}\n${jsonInput}`)
         this.emitPart(turn, {
           type: "tool-input-start",
           id: callId,
@@ -2093,11 +2245,27 @@ export class SessionBridgeManager {
         })
 
         // If any relayed OpenCode tool calls were waiting for this native tool to settle, flush them now!
-        if (turn.activeNativeTools.size === 0 && turn.pendingMcpCalls.size > 0) {
+        if (turn.pendingMcpCalls.size > 0) {
           this.tryFlushToolCalls(s, turn)
         }
       }
     }
+  }
+
+  /** Closes agy's ask_question call; the OpenCode question part shows the answer. */
+  private settleNativeToolForUserInput(turn: ActiveTurn, toolCallId: string): void {
+    const toolName = turn.activeNativeTools.get(toolCallId)
+    if (toolName === undefined) return
+    turn.activeNativeTools.delete(toolCallId)
+    turn.relayedUpdateIds.add(toolCallId)
+    this.emitPart(turn, {
+      type: "tool-result",
+      toolCallId,
+      toolName,
+      result: { status: "asked", message: "Asked the user with OpenCode's question tool." },
+      isError: false,
+      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+    })
   }
 
   private finishUnconfirmedNativeTools(turn: ActiveTurn): void {
