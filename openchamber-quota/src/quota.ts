@@ -73,7 +73,8 @@ function toWindow(bucket: AgyBucket, seconds: number | null): QuotaProviderWindo
   return {
     usedPercent: remaining === null ? null : Math.round(Math.min(100, Math.max(0, (1 - remaining) * 100)) * 10) / 10,
     windowSeconds: seconds,
-    resetAt: Number.isFinite(resetAt) ? resetAt : null,
+    // agy gives an epoch-zero time for a window that has not started.
+    resetAt: Number.isFinite(resetAt) && resetAt > 0 ? resetAt : null,
   }
 }
 

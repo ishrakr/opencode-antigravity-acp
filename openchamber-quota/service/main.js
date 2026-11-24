@@ -55,7 +55,7 @@ function toWindow(bucket, seconds) {
   return {
     usedPercent: remaining === null ? null : Math.round(Math.min(100, Math.max(0, (1 - remaining) * 100)) * 10) / 10,
     windowSeconds: seconds,
-    resetAt: Number.isFinite(resetAt) ? resetAt : null
+    resetAt: Number.isFinite(resetAt) && resetAt > 0 ? resetAt : null
   };
 }
 function toUsageData(output) {

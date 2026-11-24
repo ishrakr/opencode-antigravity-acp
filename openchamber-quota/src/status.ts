@@ -1,5 +1,5 @@
-// The Antigravity section in Work Status. OpenChamber cannot hide a section per
-// session, so outside Antigravity sessions it shrinks to one line.
+// The Antigravity section in Work Status. It shows the quota in every session;
+// in an Antigravity session that session's group comes first.
 import { connectHost, HostRequestError, type QuotaProviderUsageData } from "@openchamber/sdk"
 import { applyHostReady } from "@openchamber/sdk/ui"
 import { antigravityModelOf, formatReset, toGroupViews, type GroupView } from "./view.ts"
@@ -54,8 +54,8 @@ let lastRead = 0
 
 const note = (text: string, error = false) => root.replaceChildren(el("div", error ? "note error" : "note", text))
 
-function drawGroup(group: GroupView, now: number): HTMLElement {
-  const box = el("div", group.current ? "group" : "group other")
+function drawGroup(group: GroupView, now: number, marked: boolean): HTMLElement {
+  const box = el("div", group.current || !marked ? "group" : "group other")
   const name = el("div", "name", group.name)
   if (group.current) name.append(el("span", "tag", "this session"))
   box.append(name)
@@ -79,10 +79,6 @@ function drawGroup(group: GroupView, now: number): HTMLElement {
 }
 
 function render(): void {
-  if (modelId === null) {
-    note("Not used in this session")
-    return
-  }
   if (failure) {
     note(failure, true)
     return
@@ -101,7 +97,9 @@ function render(): void {
     note("agy reported no quota groups.")
     return
   }
-  root.replaceChildren(...groups.map((group) => drawGroup(group, now)))
+  // Outside Antigravity sessions no group is dimmed.
+  const marked = groups.some((group) => group.current)
+  root.replaceChildren(...groups.map((group) => drawGroup(group, now, marked)))
 }
 
 function failureText(error: unknown): string {
@@ -113,7 +111,7 @@ function failureText(error: unknown): string {
 }
 
 async function read(): Promise<void> {
-  if (loading || modelId === null || document.hidden) return
+  if (loading || document.hidden) return
   loading = true
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/usage" })
@@ -149,7 +147,7 @@ host.onSession((session) => {
   if (next === modelId) return
   modelId = next
   render()
-  if (modelId !== null && Date.now() - lastRead > REFRESH_MS / 2) void read()
+  if (Date.now() - lastRead > REFRESH_MS / 2) void read()
 })
 
 setInterval(() => void read(), REFRESH_MS)
@@ -157,3 +155,4 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && Date.now() - lastRead > REFRESH_MS) void read()
 })
 render()
+void read()

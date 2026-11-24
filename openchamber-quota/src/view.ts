@@ -57,7 +57,7 @@ function toLine(key: string, window: QuotaProviderWindow): WindowLine {
     label: WINDOW_LABELS[key] ?? key.replace(/_/g, " "),
     remaining,
     tone: toneFor(remaining),
-    resetAt: typeof window.resetAt === "number" ? window.resetAt : null,
+    resetAt: typeof window.resetAt === "number" && window.resetAt > 0 ? window.resetAt : null,
   }
 }
 
@@ -66,12 +66,15 @@ const windowRank = (key: string) => {
   return i < 0 ? WINDOW_ORDER.length : i
 }
 
-/** The session's own group first, then the others; windows shortest first. */
-export function toGroupViews(data: QuotaProviderUsageData, modelId: string): GroupView[] {
+/**
+ * Every group, windows shortest first. In an Antigravity session (`modelId`),
+ * that session's group comes first and is marked current.
+ */
+export function toGroupViews(data: QuotaProviderUsageData, modelId: string | null = null): GroupView[] {
   const models = data.usage?.models ?? {}
   const groups = Object.entries(models).map(([name, model]) => ({
     name: shortGroupName(name),
-    current: groupMatchesModel(name, modelId),
+    current: modelId !== null && groupMatchesModel(name, modelId),
     windows: Object.entries(model.windows ?? {})
       .sort(([a], [b]) => windowRank(a) - windowRank(b))
       .map(([key, window]) => toLine(key, window)),
@@ -94,11 +97,11 @@ const SUMMARY_MAX = 500
 
 /**
  * What `/agy-quota` shows: each group's windows with what is left and when it
- * refills, Gemini first. With an Antigravity `modelId`, that group comes first.
+ * refills. With an Antigravity `modelId`, that group comes first.
  */
 export function quotaSummary(data: QuotaProviderUsageData, now: number, modelId: string | null = null, locale?: string): string {
   if (!data.ok || !data.usage) return (data.error ?? "agy reported no quota.").slice(0, SUMMARY_MAX)
-  const groups = toGroupViews(data, modelId ?? "gemini")
+  const groups = toGroupViews(data, modelId)
   if (groups.length === 0) return "agy reported no quota groups."
   const lines = groups.map((group) => {
     const windows = group.windows.map((line) => {
@@ -106,7 +109,7 @@ export function quotaSummary(data: QuotaProviderUsageData, now: number, modelId:
       const refill = line.resetAt !== null && line.resetAt > now ? `, refills ${formatReset(line.resetAt, now, locale)}` : ""
       return `${line.label} ${left}${refill}`
     })
-    const tag = modelId !== null && group.current ? " (this session)" : ""
+    const tag = group.current ? " (this session)" : ""
     return `${group.name}${tag}: ${windows.join(" · ")}`
   })
   const text = `Antigravity quota\n${lines.join("\n")}`

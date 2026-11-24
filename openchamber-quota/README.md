@@ -2,7 +2,7 @@
 
 An OpenChamber extension that adds an **Antigravity** section to Work Status: the remaining 5-hour and weekly limits of each Antigravity model group (Gemini, Claude & GPT), with refill times.
 
-In a session that uses an Antigravity model it lists both groups, the session's group first and marked "this session". In any other session it shrinks to one line, "Not used in this session". (OpenChamber has no way for an extension to hide its section per session; you can hide it for good from the Work Status section chooser.)
+It shows both groups in every session. In a session that uses an Antigravity model, that session's group comes first and is marked "this session".
 
 It adds no card to Settings → Usage, so Antigravity no longer appears in OpenChamber's general Usage section.
 

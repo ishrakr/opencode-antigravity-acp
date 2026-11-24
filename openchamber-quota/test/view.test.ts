@@ -61,6 +61,10 @@ describe("group views", () => {
       ["Weekly", 42, "warning"],
     ])
     expect(toGroupViews(usage, "gemini-4-neon")[0].name).toBe("Gemini")
+    // Outside Antigravity sessions every group shows, none marked.
+    const plain = toGroupViews(usage)
+    expect(plain.map((g) => g.name)).toEqual(["Gemini", "Claude & GPT"])
+    expect(plain.some((g) => g.current)).toBe(false)
   })
 
   test("tones", () => {
@@ -99,5 +103,17 @@ describe("/agy-quota summary", () => {
 
   test("shows agy's error", () => {
     expect(quotaSummary({ ok: false, configured: true, error: "agy was not found", usage: null }, now)).toBe("agy was not found")
+  })
+})
+
+describe("refill times", () => {
+  test("a window agy has not started has no refill time", () => {
+    const unused = toUsageData({
+      status: "SUCCESS",
+      command: { data: { groups: [{ name: "Claude and GPT models", buckets: [{ id: "3p-5h", window: "5h", remaining_fraction: 1, reset_time: "1970-01-01T00:00:00Z" }] }] } },
+    })
+    expect(unused.usage?.models?.["Claude and GPT models"]?.windows["5h"]?.resetAt).toBeNull()
+    const zero = { ok: true, configured: true, usage: { windows: {}, models: { "Claude and GPT models": { windows: { "5h": { usedPercent: 0, windowSeconds: 18000, resetAt: 0 } } } } } } as const
+    expect(toGroupViews(zero as any)[0].windows[0].resetAt).toBeNull()
   })
 })
