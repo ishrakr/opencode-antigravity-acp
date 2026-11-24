@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { quotaProviderSchemasV1 } from "@openchamber/sdk/schemas"
@@ -62,17 +62,21 @@ describe("agy /quota to OpenChamber usage", () => {
 
   test("runs agy and reports a missing binary or bad output", async () => {
     const dir = mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "agy-quota-"))
-    const fake = path.join(dir, "agy")
-    writeFileSync(fake, `#!/bin/sh\n[ "$1 $2" = "-p /quota" ] || exit 9\ncat <<'EOF'\n${JSON.stringify(recorded)}\nEOF\n`)
-    chmodSync(fake, 0o755)
-    expect((await runAgyQuota(fake, dir)).ok).toBe(true)
+    try {
+      const fake = path.join(dir, "agy")
+      writeFileSync(fake, `#!/bin/sh\n[ "$1 $2" = "-p /quota" ] || exit 9\ncat <<'EOF'\n${JSON.stringify(recorded)}\nEOF\n`)
+      chmodSync(fake, 0o755)
+      expect((await runAgyQuota(fake, dir)).ok).toBe(true)
 
-    writeFileSync(fake, "#!/bin/sh\necho 'boom' >&2\nexit 1\n")
-    const bad = await runAgyQuota(fake, dir)
-    expect(bad).toMatchObject({ ok: false, configured: true })
-    expect(bad.error).toContain("boom")
+      writeFileSync(fake, "#!/bin/sh\necho 'boom' >&2\nexit 1\n")
+      const bad = await runAgyQuota(fake, dir)
+      expect(bad).toMatchObject({ ok: false, configured: true })
+      expect(bad.error).toContain("boom")
 
-    const missing = await runAgyQuota(path.join(dir, "nope"), dir)
-    expect(missing.error).toContain("agy was not found")
+      const missing = await runAgyQuota(path.join(dir, "nope"), dir)
+      expect(missing.error).toContain("agy was not found")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
