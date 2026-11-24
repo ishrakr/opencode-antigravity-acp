@@ -381,7 +381,8 @@ export function resolveAcpModelTarget(
       `Antigravity no longer offers the model "${baseModelId}". Pick another Antigravity model; reload the model list if it is missing.`,
     )
   }
-  if (variant) {
+  // OpenCode sends "default" when no level is picked: use agy's default level.
+  if (variant && variant !== "default") {
     const matched = found.variants.find((v) => v.id === variant)
     if (matched) {
       return {

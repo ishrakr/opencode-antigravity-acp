@@ -283,6 +283,10 @@ describe("model availability and defaults", () => {
     expect(() => resolveAcpModelTarget(FALLBACK_MODELS, "gemini-9")).toThrow(UnavailableModelError)
     expect(() => resolveAcpModelTarget(FALLBACK_MODELS, "gemini-4-argon", "xhigh")).toThrow(/low, medium, high/)
     expect(resolveAcpModelTarget(FALLBACK_MODELS, "gemini-3.8-flash").acpModelId).toBe("gemini-3.8-flash-high")
+    // OpenCode's "default" variant means no level was picked.
+    expect(resolveAcpModelTarget(FALLBACK_MODELS, "gemini-4-hydrogen", "default").acpModelId).toBe(
+      "gemini-4-hydrogen-high",
+    )
   })
 
   test("the default thinking level is agy's current one", () => {
