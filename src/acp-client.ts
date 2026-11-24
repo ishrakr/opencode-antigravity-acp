@@ -78,17 +78,11 @@ export interface AcpDiscoveredModel {
   readonly defaultAcpModelId: string
 }
 
-export interface AcpMcpServerHttp {
-  readonly type: "http"
-  readonly name: string
-  readonly url: string
-  readonly headers?: ReadonlyArray<{ readonly name: string; readonly value: string }>
-}
-
 export interface AcpPermissionOption {
   readonly optionId: string
   readonly name?: string
   readonly kind?: string
+  readonly _meta?: Record<string, unknown>
 }
 
 export interface AcpPermissionRequestParams {
@@ -125,6 +119,13 @@ export type AcpPermissionOutcome =
 export type AcpContentBlock =
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "image"; readonly data: string; readonly mimeType: string }
+  /** Embedded text file; agy advertises `embeddedContext`. */
+  | {
+      readonly type: "resource"
+      readonly resource: { readonly uri: string; readonly mimeType: string; readonly text: string }
+    }
+  /** A file on disk that agy reads with its own tools, such as a PDF. */
+  | { readonly type: "resource_link"; readonly uri: string; readonly name: string; readonly mimeType?: string }
 
 export interface AcpSessionUpdate {
   readonly sessionUpdate: string
@@ -178,7 +179,7 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     id: "gemini-4-argon",
     name: "Gemini 4 Argon",
     family: "gemini-4-argon",
-    defaultAcpModelId: "gemini-4-argon-medium",
+    defaultAcpModelId: "gemini-4-argon-high",
     variants: [
       { id: "low", acpModelId: "gemini-4-argon-low", thoughtLevel: "low" },
       { id: "medium", acpModelId: "gemini-4-argon-medium", thoughtLevel: "medium" },
@@ -215,7 +216,7 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     id: "gemini-3.8-flash",
     name: "Gemini 3.8 Flash",
     family: "gemini-3.8-flash",
-    defaultAcpModelId: "gemini-3.8-flash-medium",
+    defaultAcpModelId: "gemini-3.8-flash-high",
     variants: [
       { id: "low", acpModelId: "gemini-3.8-flash-low", thoughtLevel: "low" },
       { id: "medium", acpModelId: "gemini-3.8-flash-medium", thoughtLevel: "medium" },
@@ -226,7 +227,7 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     id: "claude-opus-5-5",
     name: "Claude Opus 5.5",
     family: "claude-opus-5-5",
-    defaultAcpModelId: "claude-opus-5-5-medium",
+    defaultAcpModelId: "claude-opus-5-5-high",
     variants: [
       { id: "low", acpModelId: "claude-opus-5-5-low", thoughtLevel: "low" },
       { id: "medium", acpModelId: "claude-opus-5-5-medium", thoughtLevel: "medium" },
@@ -237,7 +238,7 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     id: "claude-sonnet-5-5",
     name: "Claude Sonnet 5.5",
     family: "claude-sonnet-5-5",
-    defaultAcpModelId: "claude-sonnet-5-5-medium",
+    defaultAcpModelId: "claude-sonnet-5-5-high",
     variants: [
       { id: "low", acpModelId: "claude-sonnet-5-5-low", thoughtLevel: "low" },
       { id: "medium", acpModelId: "claude-sonnet-5-5-medium", thoughtLevel: "medium" },
@@ -253,6 +254,17 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
   },
 ]
 
+/**
+ * Families T3 Code's model manifest marks legacy. OpenCode hides `deprecated`
+ * models from its pickers, as T3 Code hides legacy ones; a session already
+ * on such a model keeps working while agy still offers it.
+ */
+const LEGACY_MODEL_PREFIXES = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-pro-agent", "gemini-3.1-pro"]
+
+export function isLegacyAcpModel(id: string): boolean {
+  return LEGACY_MODEL_PREFIXES.some((prefix) => id === prefix || id.startsWith(`${prefix}-`))
+}
+
 function cleanDisplayName(raw: string | undefined, fallback: string): string {
   return (raw ?? fallback).replace(/\s*\(ACP\)\s*$/i, "").trim() || fallback
 }
@@ -266,6 +278,8 @@ export function buildModelCatalog(sessionResult: any): readonly AcpDiscoveredMod
   const thoughtOrder: string[] = Array.isArray(thoughtOpt?.options)
     ? thoughtOpt.options.map((o: any) => String(o.value))
     : ["low", "medium", "high", "xhigh"]
+  // agy's own default thinking level, as T3 Code keeps the session's current setting.
+  const defaultLevel = typeof thoughtOpt?.currentValue === "string" ? thoughtOpt.currentValue : "high"
 
   const baseList: Array<{ value: string; name: string }> = Array.isArray(modelOpt?.options)
     ? modelOpt.options.map((o: any) => ({ value: String(o.value), name: String(o.name ?? o.value) }))
@@ -316,8 +330,9 @@ export function buildModelCatalog(sessionResult: any): readonly AcpDiscoveredMod
 
     const defaultAcpModelId = availIds.has(base.value)
       ? base.value
-      : variants.find((v) => v.id === "medium")?.acpModelId ??
+      : variants.find((v) => v.id === defaultLevel)?.acpModelId ??
         variants.find((v) => v.id === "high")?.acpModelId ??
+        variants.find((v) => v.id === "medium")?.acpModelId ??
         variants[0]?.acpModelId ??
         base.value
 
@@ -344,6 +359,17 @@ export function buildModelCatalog(sessionResult: any): readonly AcpDiscoveredMod
   return catalog
 }
 
+export class UnavailableModelError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "UnavailableModelError"
+  }
+}
+
+/**
+ * Maps an OpenCode model and variant to the ID agy runs. A model or thinking
+ * level agy no longer offers is an error, never a silent substitute.
+ */
 export function resolveAcpModelTarget(
   models: readonly AcpDiscoveredModel[],
   baseModelId: string,
@@ -351,11 +377,9 @@ export function resolveAcpModelTarget(
 ): { acpModelId: string; baseModelId: string; thoughtLevel?: string } {
   const found = models.find((m) => m.id === baseModelId)
   if (!found) {
-    return {
-      baseModelId,
-      acpModelId: variant ? `${baseModelId}-${variant}` : baseModelId,
-      thoughtLevel: variant || undefined,
-    }
+    throw new UnavailableModelError(
+      `Antigravity no longer offers the model "${baseModelId}". Pick another Antigravity model; reload the model list if it is missing.`,
+    )
   }
   if (variant) {
     const matched = found.variants.find((v) => v.id === variant)
@@ -366,6 +390,11 @@ export function resolveAcpModelTarget(
         thoughtLevel: matched.thoughtLevel,
       }
     }
+    throw new UnavailableModelError(
+      found.variants.length > 0
+        ? `${found.name} has no "${variant}" thinking level in Antigravity. Pick one of: ${found.variants.map((v) => v.id).join(", ")}.`
+        : `${found.name} has no thinking levels in Antigravity. Clear the "${variant}" variant.`,
+    )
   }
   return {
     baseModelId: found.id,
@@ -376,6 +405,8 @@ export function resolveAcpModelTarget(
 
 export interface AcpProcessOptions {
   readonly cwd: string
+  /** The selected sign-in method; the personal Google account when omitted. */
+  readonly auth?: AcpAuthConfig
   readonly binaryPath?: string
   readonly extraDirs?: readonly string[]
   readonly dangerouslySkipPermissions?: boolean
@@ -415,56 +446,128 @@ const KNOWN_AUTH_METHODS: readonly string[] = [
 ]
 
 /**
- * Resolves which ACP auth method to use.
- * Explicit `ANTIGRAVITY_ACP_AUTH_METHOD` wins; otherwise `GEMINI_API_KEY`
- * selects `gemini-api-key`; otherwise thin consumer default `oauth-personal`.
+ * The sign-in method the user selected, and what it needs. Like T3 Code, the
+ * plugin uses exactly this method and never falls back to another one.
  */
-export function resolveAcpAuthMethod(env: NodeJS.ProcessEnv = process.env): AcpAuthMethodId {
-  const override = env.ANTIGRAVITY_ACP_AUTH_METHOD?.trim()
-  if (override && (KNOWN_AUTH_METHODS as readonly string[]).includes(override)) {
-    return override as AcpAuthMethodId
-  }
-  if (env.GEMINI_API_KEY?.trim()) return "gemini-api-key"
-  return "oauth-personal"
-}
-
-export interface AcpAuthenticateParams {
-  readonly methodId?: string
+export interface AcpAuthConfig {
+  readonly method: AcpAuthMethodId
+  /** gemini-api-key: the Gemini API key. agent-platform: an Agent Platform API key. */
   readonly apiKey?: string
+  /** oauth-business and agent-platform. */
+  readonly gcpProject?: string
+  readonly gcpLocation?: string
 }
 
-const OAUTH_COLLIDING_ENV_KEYS = [
+export class AcpAuthConfigError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "AcpAuthConfigError"
+  }
+}
+
+function optionString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+/**
+ * Reads the sign-in method from the plugin options, else from
+ * `ANTIGRAVITY_ACP_AUTH_METHOD`, else uses the personal Google account.
+ * Credentials come only from the plugin options or the plugin's own
+ * `ANTIGRAVITY_ACP_*` variables: an ambient `GEMINI_API_KEY` or `GOOGLE_*`
+ * variable never selects or changes the method.
+ */
+export function resolveAcpAuthConfig(
+  options: Readonly<Record<string, unknown>> = {},
+  env: NodeJS.ProcessEnv = process.env,
+): AcpAuthConfig {
+  const raw = optionString(options.authMethod) ?? optionString(env.ANTIGRAVITY_ACP_AUTH_METHOD)
+  if (raw !== undefined && !KNOWN_AUTH_METHODS.includes(raw)) {
+    throw new AcpAuthConfigError(
+      `Unknown Antigravity sign-in method "${raw}". Use one of: ${KNOWN_AUTH_METHODS.join(", ")}.`,
+    )
+  }
+  const method = (raw ?? "oauth-personal") as AcpAuthMethodId
+  const apiKey = optionString(options.apiKey) ?? optionString(env.ANTIGRAVITY_ACP_API_KEY)
+  const gcpProject = optionString(options.gcpProject) ?? optionString(env.ANTIGRAVITY_ACP_GCP_PROJECT)
+  const gcpLocation = optionString(options.gcpLocation) ?? optionString(env.ANTIGRAVITY_ACP_GCP_LOCATION)
+  switch (method) {
+    case "oauth-personal":
+      return { method }
+    case "oauth-business":
+      return { method, gcpProject, gcpLocation }
+    case "gemini-api-key":
+      if (!apiKey) {
+        throw new AcpAuthConfigError(
+          'Sign-in method "gemini-api-key" needs an API key: set the plugin option "apiKey" or ANTIGRAVITY_ACP_API_KEY.',
+        )
+      }
+      return { method, apiKey }
+    case "agent-platform":
+      if (!apiKey && !(gcpProject && gcpLocation)) {
+        throw new AcpAuthConfigError(
+          'Sign-in method "agent-platform" needs an API key, or a GCP project and location (plugin options "gcpProject" and "gcpLocation") with Application Default Credentials.',
+        )
+      }
+      return { method, apiKey, gcpProject, gcpLocation }
+  }
+}
+
+/** Human-readable name of a sign-in method, as T3 Code labels them. */
+export function authMethodLabel(method: AcpAuthMethodId): string {
+  switch (method) {
+    case "oauth-personal":
+      return "Google account"
+    case "oauth-business":
+      return "Gemini Enterprise"
+    case "gemini-api-key":
+      return "Gemini API key"
+    case "agent-platform":
+      return "Agent Platform"
+  }
+}
+
+/** Ambient credentials `agy` would otherwise pick up on its own. */
+const AMBIENT_CREDENTIAL_ENV_KEYS = [
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_GENAI_USE_VERTEXAI",
   "GOOGLE_APPLICATION_CREDENTIALS",
 ] as const
 
 /**
- * Builds the child-process env for spawning `agy acp`.
- * When the effective auth method is an OAuth browser flow (`oauth-personal`
- * or `oauth-business`), ambient `GEMINI_API_KEY` / `GOOGLE_API_KEY` /
- * `GOOGLE_APPLICATION_CREDENTIALS` are scrubbed so stray keys never collide
- * with the OAuth login. Kept when `gemini-api-key` or `agent-platform` is selected.
- * On Windows the match is case-insensitive (env vars are case-insensitive
- * there); exact match everywhere else.
+ * Builds the child-process env for spawning `agy acp`: ambient Gemini and
+ * Google credential variables are removed, then only the selected method's
+ * own values are set. Agent Platform with a project keeps
+ * `GOOGLE_APPLICATION_CREDENTIALS`, since Application Default Credentials
+ * live on the machine. On Windows the match is case-insensitive.
  */
 export function buildAgySpawnEnv(
+  auth: AcpAuthConfig,
   source: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...source }
-  const method = resolveAcpAuthMethod(source)
-  if (method === "oauth-personal" || method === "oauth-business") {
-    if (platform === "win32") {
-      const doomed = new Set(OAUTH_COLLIDING_ENV_KEYS.map((k) => k.toLowerCase()))
-      for (const key of Object.keys(env)) {
-        if (doomed.has(key.toLowerCase())) delete env[key]
-      }
-    } else {
-      for (const key of OAUTH_COLLIDING_ENV_KEYS) {
-        delete env[key]
-      }
-    }
+  const keepAdc = auth.method === "agent-platform" && !auth.apiKey
+  const doomed = new Set<string>(
+    AMBIENT_CREDENTIAL_ENV_KEYS.filter((k) => !(keepAdc && k === "GOOGLE_APPLICATION_CREDENTIALS")),
+  )
+  for (const key of Object.keys(env)) {
+    if (doomed.has(platform === "win32" ? key.toUpperCase() : key)) delete env[key]
+  }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("ANTIGRAVITY_ACP_")) delete env[key]
+  }
+  if (auth.method === "gemini-api-key" && auth.apiKey) {
+    env.GEMINI_API_KEY = auth.apiKey
+  }
+  if (auth.method === "agent-platform" && auth.apiKey) {
+    env.GOOGLE_API_KEY = auth.apiKey
+  }
+  if (auth.method === "agent-platform" || auth.method === "oauth-business") {
+    if (auth.gcpProject) env.GOOGLE_CLOUD_PROJECT = auth.gcpProject
+    if (auth.gcpLocation) env.GOOGLE_CLOUD_LOCATION = auth.gcpLocation
   }
   return env
 }
@@ -480,8 +583,10 @@ export class AcpProcess {
   private closed = false
   private exitNotified = false
   private binary: string
+  readonly auth: AcpAuthConfig
 
   constructor(private readonly options: AcpProcessOptions) {
+    this.auth = options.auth ?? { method: "oauth-personal" }
     const args = ["acp", "--stdio", "--process-per-session"]
     if (options.dangerouslySkipPermissions) {
       args.push("--dangerously-skip-permissions")
@@ -495,7 +600,7 @@ export class AcpProcess {
     this.proc = spawn(binary, args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: buildAgySpawnEnv(),
+      env: buildAgySpawnEnv(this.auth),
       detached: process.platform !== "win32",
     })
 
@@ -849,28 +954,17 @@ export class AcpProcess {
     )
   }
 
-  newSession(params: {
-    readonly cwd: string
-    readonly mcpServers?: readonly AcpMcpServerHttp[]
-  }): Promise<any> {
-    const payload: any = {
-      cwd: params.cwd,
-      mcpServers: params.mcpServers ? [...params.mcpServers] : [],
-    }
-    return this.request("session/new", payload, 30_000)
+  // No MCP servers: Antigravity uses its own, as with T3 Code.
+  newSession(params: { readonly cwd: string }): Promise<any> {
+    return this.request("session/new", { cwd: params.cwd, mcpServers: [] }, 30_000)
   }
 
-  resumeSession(params: {
-    readonly sessionId: string
-    readonly cwd: string
-    readonly mcpServers?: readonly AcpMcpServerHttp[]
-  }): Promise<any> {
-    const payload: any = {
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      mcpServers: params.mcpServers ? [...params.mcpServers] : [],
-    }
-    return this.request("session/resume", payload, 20_000)
+  resumeSession(params: { readonly sessionId: string; readonly cwd: string }): Promise<any> {
+    return this.request(
+      "session/resume",
+      { sessionId: params.sessionId, cwd: params.cwd, mcpServers: [] },
+      20_000,
+    )
   }
 
   setModel(sessionId: string, modelId: string): Promise<any> {
@@ -886,32 +980,13 @@ export class AcpProcess {
   }
 
   /**
-   * Explicit ACP authentication against the local `agy acp` server.
-   * Uses the official `authenticate` method with `{ methodId }`:
-   * explicit `ANTIGRAVITY_ACP_AUTH_METHOD` wins, else `GEMINI_API_KEY`
-   * selects `gemini-api-key`, else thin consumer default `oauth-personal`.
-   * Benign already-authenticated errors resolve `undefined` so cached/env
-   * auth keeps working seamlessly. Unknown servers resolve `undefined`.
+   * Official ACP `authenticate` with exactly the selected method, never
+   * another one. The method's credentials reach `agy` through its
+   * environment (see `buildAgySpawnEnv`). Benign already-authenticated
+   * errors resolve `undefined` so a cached sign-in keeps working.
    */
-  async authenticate(params?: AcpAuthenticateParams): Promise<any | undefined> {
-    const rawMethod = params?.methodId
-    const methodId =
-      rawMethod && (KNOWN_AUTH_METHODS as readonly string[]).includes(rawMethod)
-        ? rawMethod
-        : resolveAcpAuthMethod()
-    if (
-      methodId === "gemini-api-key" &&
-      !process.env.GEMINI_API_KEY?.trim() &&
-      !params?.apiKey?.trim()
-    ) {
-      throw new Error(
-        'ACP auth method "gemini-api-key" requires GEMINI_API_KEY to be set (or pass apiKey). Set GEMINI_API_KEY or choose another method via ANTIGRAVITY_ACP_AUTH_METHOD (oauth-personal | oauth-business | gemini-api-key | agent-platform).',
-      )
-    }
-    const payload: any = { methodId }
-    if (params?.apiKey) {
-      payload._meta = { apiKey: params.apiKey }
-    }
+  async authenticate(): Promise<any | undefined> {
+    const payload = { methodId: this.auth.method }
     try {
       return await this.request("authenticate", payload, 10_000)
     } catch (err) {
@@ -1000,12 +1075,13 @@ export class AcpProcess {
 
 export async function discoverAcpModels(
   cwd: string,
-  options?: { readonly binaryPath?: string },
+  options?: { readonly binaryPath?: string; readonly auth?: AcpAuthConfig },
 ): Promise<readonly AcpDiscoveredModel[]> {
-  const proc = new AcpProcess({ cwd, binaryPath: options?.binaryPath })
+  const proc = new AcpProcess({ cwd, binaryPath: options?.binaryPath, auth: options?.auth })
   try {
     await proc.initialize()
-    const sess = await proc.newSession({ cwd, mcpServers: [] })
+    await proc.authenticate()
+    const sess = await proc.newSession({ cwd })
     const catalog = buildModelCatalog(sess)
     if (sess?.sessionId) {
       await proc.closeSession(String(sess.sessionId))

@@ -1,7 +1,7 @@
 {
   "name": "@ishrakr/opencode-antigravity-acp",
   "version": "0.3.0",
-  "description": "Use your Antigravity subscription models in OpenCode via the official agy acp protocol, with seamless cross-model switching via plain-text handoff, Code Mode default, and Pure ACP opt-out.",
+  "description": "Run Google Antigravity as the agent in OpenCode through the official agy acp protocol, as an ACP client like T3 Code and Zed.",
   "author": "system1970",
   "license": "MIT",
   "repository": {
@@ -18,8 +18,7 @@
     "antigravity",
     "acp",
     "agent-client-protocol",
-    "mcp",
-    "codemode"
+    "t3code"
   ],
   "type": "module",
   "exports": {

@@ -6,29 +6,23 @@ import { Effect } from "effect"
 import {
   AgyNotFoundError,
   FALLBACK_MODELS,
+  AcpAuthConfigError,
   buildAgySpawnEnv,
   buildModelCatalog,
   discoverAcpModels,
-  resolveAcpAuthMethod,
+  resolveAcpAuthConfig,
   resolveAgyBinary,
   type AcpDiscoveredModel,
   type AcpSessionUpdate,
 } from "../src/acp-client.js"
 import {
   API_ERROR_ABORT_PATTERN,
-  TEXT_ONLY_HANDOFF_HEADER,
-  UNSAFE_INTERNAL_SIGNATURE,
-  buildTextOnlyHandoffPromptBlocks,
   buildThinAcpPromptBlocks,
-  extractSafeAcpContext,
   hasNonAcpAssistantHistory,
-  hasUnseenNonAcpAssistantHistory,
   isSyntheticRestartAfterError,
   sanitizeForAcpModel,
   sanitizeForNonAcpModel,
-  stripUnsafeInternalLines,
 } from "../src/history-sanitizer.js"
-import { McpRelayServer } from "../src/mcp-relay.js"
 import {
   elicitationToQuestions,
   isAcpUserInputRequest,
@@ -42,6 +36,8 @@ import {
   unifiedDiff,
 } from "../src/tool-display.js"
 import {
+  FOREIGN_HISTORY_MESSAGE,
+  RESUME_LOST_NOTICE,
   SessionBridgeManager,
   quotaBucketForModel,
   resetSharedCatalogForTests,
@@ -106,57 +102,6 @@ describe("resolveAgyBinary & missing binary handling", () => {
     await expect(
       discoverAcpModels("/tmp", { binaryPath: "/nonexistent/path/agy-missing-bin" }),
     ).rejects.toBeInstanceOf(AgyNotFoundError)
-  })
-})
-
-describe("McpRelayServer", () => {
-  test("supports start -> stop -> start, concurrent stop, auth, and tool scrubbing", async () => {
-    const relay = new McpRelayServer({
-      getTools: () => [
-        {
-          name: "mcp_oc_execute",
-          description: "Run JS code.\ntools.opencode.session_move({})\nSafe tool line.",
-          inputSchema: { type: "object", properties: { code: { type: "string" } } },
-        },
-      ],
-      callTool: async () => ({ content: [{ type: "text", text: "ok" }] }),
-    })
-
-    expect(() => relay.urlForSession("s1")).toThrow(/McpRelayServer has not started/)
-
-    await relay.start()
-    const url1 = relay.urlForSession("s1")
-    expect(url1).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/s1$/)
-
-    const unauth = await fetch(url1, { method: "POST", body: "{}" })
-    expect(unauth.status).toBe(401)
-
-    const listRes = await fetch(url1, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${relay.token}`,
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
-    })
-    expect(listRes.status).toBe(200)
-    const listJson = (await listRes.json()) as any
-    const desc = listJson.result.tools[0].description as string
-    expect(UNSAFE_INTERNAL_SIGNATURE.test(desc)).toBe(false)
-    expect(desc).toContain("Safe tool line.")
-
-    await relay.stop()
-    expect(() => relay.urlForSession("s1")).toThrow(/McpRelayServer has not started/)
-
-    await relay.start()
-    const url2 = relay.urlForSession("s1")
-    expect(url2).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/s1$/)
-    await relay.stop()
-
-    const startP = relay.start()
-    const stopP = relay.stop()
-    await Promise.allSettled([startP, stopP])
-    expect(() => relay.urlForSession("s1")).toThrow(/McpRelayServer has not started/)
   })
 })
 
@@ -559,26 +504,25 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
   test("mid-turn disposeAll() cleanly terminates stream with plugin_unloaded", async () => {
     const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
     const sessionObj = (bridge as any).getOrCreateSession("sess-active")
-    let resolvedMcp!: (res: any) => void
-    const mcpPromise = new Promise((resolve) => {
-      resolvedMcp = resolve
+    let resolveQuestion!: (res: any) => void
+    const questionPromise = new Promise((resolve) => {
+      resolveQuestion = resolve
     })
     const turnObj: any = {
       bufferedParts: [],
       partSeq: 0,
       activeNativeTools: new Map(),
       relayedUpdateIds: new Set(),
-      pendingMcpCalls: new Map([
+      pendingQuestions: new Map([
         [
           "call-1",
           {
             toolCallId: "call-1",
-            mcpName: "mcp_oc_execute",
-            openCodeToolName: "mcp_oc_execute",
+            openCodeToolName: "question",
             args: {},
             emittedToOpenCode: false,
             resolved: false,
-            resolve: resolvedMcp,
+            resolve: resolveQuestion,
           },
         ],
       ]),
@@ -597,8 +541,8 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
     const streamReaderPromise = readAllParts(activeStream)
     await bridge.disposeAll()
     const midTurnParts = await streamReaderPromise
-    const mcpResult = (await mcpPromise) as any
-    expect(mcpResult.isError).toBe(true)
+    const questionResult = (await questionPromise) as any
+    expect(questionResult.isError).toBe(true)
     expect(midTurnParts.some((p) => p.type === "error")).toBe(false)
     expect(midTurnParts.find((p) => p.type === "tool-result")).toMatchObject({
       toolCallId: "native-1",
@@ -759,38 +703,8 @@ describe("Model catalog & family visibility", () => {
   })
 })
 
-describe("History sanitizer & cross-model context handoff", () => {
-  test("extractSafeAcpContext strips opencode internal signatures and keeps safe context", () => {
-    const safeCtx = extractSafeAcpContext([
-      {
-        metadata: {
-          experimental: {
-            instructions: [
-              { key: "core/instructions", text: "Repo AGENTS.md rule" },
-              { key: "internal/opencode-system", text: "SHOULD BE DROPPED tools.opencode.session_move" },
-              {
-                key: "core/codemode",
-                text: [
-                  "- opencode: Internal controls",
-                  "  opencode.session_move({ id })",
-                  "  await tools.opencode.session_move()",
-                  "- external_ns: Safe workspace tool",
-                  "  external_ns.open({ url })",
-                ].join("\n"),
-              },
-            ],
-          },
-        },
-      },
-    ])
-    expect(safeCtx).toContain("Repo AGENTS.md rule")
-    expect(safeCtx).toContain("external_ns")
-    expect(UNSAFE_INTERNAL_SIGNATURE.test(safeCtx)).toBe(false)
-    expect(safeCtx).not.toContain("SHOULD BE DROPPED")
-
-    expect(stripUnsafeInternalLines("keep\ntools.opencode.session_move()\nsession_move\nok")).toBe(
-      "keep\nok",
-    )
+describe("History sanitizer & single-provider sessions", () => {
+  test("API error pattern matches upstream quota errors only", () => {
     expect(API_ERROR_ABORT_PATTERN.test("⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429)")).toBe(
       true,
     )
@@ -879,65 +793,116 @@ describe("History sanitizer & cross-model context handoff", () => {
     ).toBe(false)
   })
 
-  test("resolveAcpAuthMethod honors override, GEMINI_API_KEY, and oauth-personal default", () => {
-    expect(resolveAcpAuthMethod({ ANTIGRAVITY_ACP_AUTH_METHOD: "agent-platform" } as any)).toBe("agent-platform")
-    expect(resolveAcpAuthMethod({ GEMINI_API_KEY: "key-123" } as any)).toBe("gemini-api-key")
+  test("resolveAcpAuthConfig uses the selected method and never falls back", () => {
+    // Default: personal Google account, even with ambient keys around.
+    expect(resolveAcpAuthConfig({}, {} as any)).toEqual({ method: "oauth-personal" })
     expect(
-      resolveAcpAuthMethod({
+      resolveAcpAuthConfig({}, { GEMINI_API_KEY: "k", GOOGLE_API_KEY: "g", GOOGLE_CLOUD_PROJECT: "p" } as any),
+    ).toEqual({ method: "oauth-personal" })
+    // Plugin option wins over the plugin's env variable.
+    expect(
+      resolveAcpAuthConfig(
+        { authMethod: "gemini-api-key", apiKey: "opt-key" },
+        { ANTIGRAVITY_ACP_AUTH_METHOD: "oauth-business" } as any,
+      ),
+    ).toEqual({ method: "gemini-api-key", apiKey: "opt-key" })
+    // gemini-api-key takes its key only from the plugin, never GEMINI_API_KEY.
+    expect(() =>
+      resolveAcpAuthConfig({ authMethod: "gemini-api-key" }, { GEMINI_API_KEY: "ambient" } as any),
+    ).toThrow(AcpAuthConfigError)
+    expect(
+      resolveAcpAuthConfig({}, {
         ANTIGRAVITY_ACP_AUTH_METHOD: "gemini-api-key",
-        GEMINI_API_KEY: "key-123",
+        ANTIGRAVITY_ACP_API_KEY: "env-key",
       } as any),
-    ).toBe("gemini-api-key")
-    expect(resolveAcpAuthMethod({} as any)).toBe("oauth-personal")
+    ).toEqual({ method: "gemini-api-key", apiKey: "env-key" })
+    // agent-platform needs an API key or a project and location.
+    expect(() => resolveAcpAuthConfig({ authMethod: "agent-platform" }, {} as any)).toThrow(AcpAuthConfigError)
+    expect(
+      resolveAcpAuthConfig({ authMethod: "agent-platform", gcpProject: "proj", gcpLocation: "us-central1" }, {} as any),
+    ).toEqual({ method: "agent-platform", apiKey: undefined, gcpProject: "proj", gcpLocation: "us-central1" })
+    // Unknown methods are an error, not a silent default.
+    expect(() => resolveAcpAuthConfig({ authMethod: "oauth" }, {} as any)).toThrow(/Unknown Antigravity sign-in method/)
   })
 
-  test("thin-mode bridge defaults to Code Mode and hands off non-ACP history without a thread lock", async () => {
+  test("OpenCode's auxiliary requests never reach agy", async () => {
     const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
-    const initial = bridge.getState("thin-sess")
-    expect(initial.codeModeEnabled).toBe(true)
-    expect(initial.relayedToolCount).toBe(0)
-
-    bridge.updateContextSnapshot("thin-sess", {
-      systemText: "",
-      agent: "build",
-      tools: { read: { description: "r", input: { type: "object" } } },
-    })
-    expect(bridge.getState("thin-sess").relayedToolCount).toBe(0)
-
-    bridge.updateContextSnapshot("thin-sess", {
-      systemText: "",
-      agent: "build",
-      tools: { mytool: { description: "r", input: { type: "object" } } },
-    })
-    expect(bridge.getState("thin-sess").relayedToolCount).toBe(1)
-
-    const disabled = await bridge.setCodeMode("thin-sess", false)
-    expect(disabled.codeModeEnabled).toBe(false)
-    expect(disabled.relayedToolCount).toBe(0)
-    const enabled = await bridge.setCodeMode("thin-sess", true)
-    expect(enabled.codeModeEnabled).toBe(true)
-    expect(enabled.relayedToolCount).toBe(1)
-
-    // v0.2.0: non-ACP history no longer returns thin_history_locked. It resets
-    // to a fresh agy session and sends a plain-text-only handoff instead.
-    // Mock the ACP transport so no real `agy` binary is spawned.
-    let resetCalls = 0
-    const origSoftReset = (bridge as any).softResetForHandoff.bind(bridge)
-    ;(bridge as any).softResetForHandoff = async (sid: string) => {
-      resetCalls++
-      return origSoftReset(sid)
+    let ensureCalls = 0
+    ;(bridge as any).ensureAcpSession = async () => {
+      ensureCalls++
+      throw new Error("must not start agy")
     }
-    let capturedPrompt: any[] | undefined
-    ;(bridge as any).ensureAcpSession = async (s: any) => {
-      const fakeProc = {
-        setModel: async () => {},
-        setConfigOption: async () => {},
-        prompt: async (_sid: string, prompt: any[]) => {
-          capturedPrompt = prompt
-          return { stopReason: "end_turn" }
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const prompt = [{ role: "user", content: [{ type: "text", text: "Summarize the conversation" }] }]
+    for (const kind of ["compaction", "generate", "title"]) {
+      const res = await lm.doStream({
+        prompt,
+        headers: { "x-opencode-session-id": "aux-sess", "x-opencode-request-kind": kind },
+      } as any)
+      const parts = await readAllParts(res.stream)
+      expect(parts.some((p) => p.type === "error")).toBe(false)
+      expect(parts.find((p) => p.type === "finish")?.providerMetadata?.["antigravity-acp"]?.localStatus).toBe(true)
+    }
+    expect(ensureCalls).toBe(0)
+    await bridge.disposeAll()
+  })
+
+  test("the bridge spawns agy with its own sign-in method", async () => {
+    const seen: any[] = []
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+      auth: { method: "gemini-api-key", apiKey: "k" },
+      createProc: (opts) => {
+        seen.push(opts.auth)
+        return {
+          initialize: async () => ({}),
+          authenticate: async () => ({}),
+          newSession: async () => ({ sessionId: "acp-auth" }),
+          resumeSession: async () => undefined,
+          setModel: async () => {},
+          setMode: async () => {},
+          setConfigOption: async () => {},
+          closeSession: async () => {},
+          notifyCancel: () => {},
+          cancel: async () => {},
+          prompt: async () => ({ stopReason: "end_turn" }),
+          dispose: async () => {},
+          isClosed: false,
+        } as any
+      },
+    })
+    expect(bridge.getState("auth-sess").authMethod).toBe("Gemini API key")
+    const lm = bridge.createLanguageModel("gemini-4-neon")
+    const res = await lm.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      headers: { "x-opencode-session-id": "auth-sess" },
+    } as any)
+    await readAllParts(res.stream)
+    expect(seen).toEqual([{ method: "gemini-api-key", apiKey: "k" }])
+    await bridge.disposeAll()
+  })
+
+  test("a session with another model's replies is locked: nothing reaches agy", async () => {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
+    const state = bridge.getState("locked-sess")
+    expect(state.authMethod).toBe("Google account")
+    expect("codeModeEnabled" in state).toBe(false)
+
+    let ensureCalls = 0
+    let promptCalls = 0
+    ;(bridge as any).ensureAcpSession = async () => {
+      ensureCalls++
+      return {
+        proc: {
+          setModel: async () => {},
+          setConfigOption: async () => {},
+          prompt: async () => {
+            promptCalls++
+            return { stopReason: "end_turn" }
+          },
         },
+        acpSessionId: "acp-x",
+        resumeLost: false,
       }
-      return { proc: fakeProc, acpSessionId: "acp-fresh", freshSession: true }
     }
 
     const lm = bridge.createLanguageModel("gemini-4-neon")
@@ -947,154 +912,98 @@ describe("History sanitizer & cross-model context handoff", () => {
         { role: "assistant", content: [{ type: "text", text: "foreign reply" }] },
         { role: "user", content: [{ type: "text", text: "continue in ACP" }] },
       ],
-      headers: { "x-opencode-session-id": "thin-sess" },
+      headers: { "x-opencode-session-id": "locked-sess" },
     } as any)
     const parts = await readAllParts(res.stream)
-    expect(parts.some((p) => p.type === "error")).toBe(false)
+    const finish = parts.find((p) => p.type === "finish")
+    expect(finish?.finishReason?.raw).toBe("foreign_history")
     const text = parts.filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
-    // Handoff prompt itself isn't echoed; the turn just completes cleanly.
-    expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
-    expect(resetCalls).toBeGreaterThan(0)
-    expect(capturedPrompt).toBeDefined()
-    const handoffText = (capturedPrompt as any[]).find((b) => b.type === "text")?.text ?? ""
-    expect(handoffText).toContain("Historical conversation context")
-    expect(handoffText).toContain("foreign reply")
-    expect(JSON.stringify(capturedPrompt)).not.toContain("thin_history_locked")
-    expect(bridge.hasSession("thin-sess")).toBe(true)
+    expect(text).toBe(FOREIGN_HISTORY_MESSAGE)
+    expect(ensureCalls).toBe(0)
+    expect(promptCalls).toBe(0)
     await bridge.disposeAll()
   })
 
-  test("buildTextOnlyHandoffPromptBlocks caps at 16k and drops tool/reasoning parts", () => {
-    const blocks = buildTextOnlyHandoffPromptBlocks(
-      [
-        { role: "user", content: [{ type: "text", text: "first question" }] },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "foreign answer with tool work" },
-            { type: "tool-call", toolName: "bash", input: "{}" },
-            { type: "tool-result", toolCallId: "c1", toolName: "bash", output: { type: "text", value: "secret-output" } },
-          ],
-        } as any,
-        {
-          role: "assistant",
-          content: [{ type: "reasoning", text: "should never leak" }] as any,
-        } as any,
-        { role: "user", content: [{ type: "text", text: "second question" }] },
-        { role: "assistant", content: [{ type: "text", text: "second foreign reply" }] },
-        { role: "user", content: [{ type: "text", text: "continue in ACP now" }] },
-      ] as any,
-      { maxChars: 16_000 },
-    )
-    const joined = JSON.stringify(blocks)
-    expect(blocks[0].type).toBe("text")
-    expect((blocks[0] as any).text).toContain(TEXT_ONLY_HANDOFF_HEADER)
-    expect((blocks[0] as any).text).toContain("[Historical user]")
-    expect((blocks[0] as any).text).toContain("[Historical assistant]")
-    expect((blocks[0] as any).text).toContain("foreign answer with tool work")
-    // Tool/reasoning internals are dropped, never replayed.
-    expect(joined).not.toContain("secret-output")
-    expect(joined).not.toContain("should never leak")
-    expect(joined).not.toContain("tool-call")
-    expect(joined).not.toContain("workspace_tools_bridge")
-    expect(joined).not.toContain("workspace_context")
-    // Latest raw prompt is appended last.
-    expect((blocks[blocks.length - 1] as any).text).toBe("continue in ACP now")
-
-    // 16k cap: oversized history keeps the newest turns and stays bounded.
-    const bigText = "x".repeat(20_000)
-    const capped = buildTextOnlyHandoffPromptBlocks(
-      [
-        { role: "user", content: [{ type: "text", text: "old question" }] },
-        { role: "assistant", content: [{ type: "text", text: bigText }] },
-        { role: "user", content: [{ type: "text", text: "continue in ACP now" }] },
-      ] as any,
-      { maxChars: 16_000 },
-    )
-    expect(((capped[0] as any).text as string).length).toBeLessThanOrEqual(16_000)
-    expect((capped[capped.length - 1] as any).text).toBe("continue in ACP now")
-  })
-
-  test("hasUnseenNonAcpAssistantHistory only fires after a model switch", () => {
-    // Normal ACP-to-ACP flow: no handoff.
+  test("lock ignores plugin notices and compaction placeholders, not other models", () => {
+    const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] })
+    const local = {
+      role: "assistant",
+      content: [
+        { type: "text", text: "cooldown 12s", providerMetadata: { "antigravity-acp": { localStatus: true } } },
+      ],
+    }
+    const compacted = { role: "assistant", content: [{ type: "text", text: "[Prior assistant step]" }] }
+    const summary = {
+      role: "assistant",
+      content: [{ type: "text", text: "[Prior conversation summary]\nsummary text" }],
+    }
+    expect(hasNonAcpAssistantHistory([user("a"), local, user("b")] as any)).toBe(false)
+    expect(hasNonAcpAssistantHistory([user("a"), compacted, summary, user("b")] as any)).toBe(false)
+    // Text that merely starts like a placeholder is still another model's reply.
     expect(
-      hasUnseenNonAcpAssistantHistory([
-        { role: "user", content: [{ type: "text", text: "First ACP prompt" }] },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "ACP reply" }],
-          providerOptions: { "antigravity-acp": { acp: true } },
-        },
-        { role: "user", content: [{ type: "text", text: "follow-up in ACP" }] },
-      ] as any),
-    ).toBe(false)
-    // Muse Spark -> ACP, or ACP -> Muse Spark -> ACP: handoff.
-    expect(
-      hasUnseenNonAcpAssistantHistory([
-        { role: "user", content: [{ type: "text", text: "hello" }] },
-        { role: "assistant", content: [{ type: "text", text: "foreign reply" }] },
-        { role: "user", content: [{ type: "text", text: "continue in ACP" }] },
-      ] as any),
-    ).toBe(true)
-    expect(
-      hasUnseenNonAcpAssistantHistory([
-        { role: "user", content: [{ type: "text", text: "First ACP prompt" }] },
-        {
-          role: "assistant",
-          content: [{ type: "text", text: "ACP reply" }],
-          providerOptions: { "antigravity-acp": { acp: true } },
-        },
-        { role: "user", content: [{ type: "text", text: "ask Muse Spark" }] },
-        { role: "assistant", content: [{ type: "text", text: "spark reply" }] },
-        { role: "user", content: [{ type: "text", text: "back to ACP" }] },
+      hasNonAcpAssistantHistory([
+        user("a"),
+        { role: "assistant", content: [{ type: "text", text: "[Prior assistant step] and more" }] },
+        user("b"),
       ] as any),
     ).toBe(true)
   })
 
-  test("buildAgySpawnEnv scrubs ambient keys only for oauth-personal", () => {
-    // Explicit oauth-personal with stray ambient keys: scrubbed (the collision case).
-    const oauthEnv = buildAgySpawnEnv({
-      ANTIGRAVITY_ACP_AUTH_METHOD: "oauth-personal",
-      GEMINI_API_KEY: "k",
-      GOOGLE_API_KEY: "g",
+  test("buildAgySpawnEnv drops ambient credentials and sets only the selected method's", () => {
+    const ambient = {
+      GEMINI_API_KEY: "ambient-gemini",
+      GOOGLE_API_KEY: "ambient-google",
       GOOGLE_APPLICATION_CREDENTIALS: "/creds.json",
+      GOOGLE_CLOUD_PROJECT: "ambient-proj",
+      GOOGLE_CLOUD_LOCATION: "ambient-loc",
+      GOOGLE_GENAI_USE_VERTEXAI: "true",
+      ANTIGRAVITY_ACP_API_KEY: "plugin-key",
       OTHER: "keep",
-    } as any)
-    expect(oauthEnv.GEMINI_API_KEY).toBeUndefined()
-    expect(oauthEnv.GOOGLE_API_KEY).toBeUndefined()
-    expect(oauthEnv.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined()
-    expect(oauthEnv.OTHER).toBe("keep")
+    } as any
 
-    const keyEnv = buildAgySpawnEnv({
-      ANTIGRAVITY_ACP_AUTH_METHOD: "gemini-api-key",
-      GEMINI_API_KEY: "k",
-      GOOGLE_API_KEY: "g",
-    } as any)
-    expect(keyEnv.GEMINI_API_KEY).toBe("k")
-    expect(keyEnv.GOOGLE_API_KEY).toBe("g")
+    const personal = buildAgySpawnEnv({ method: "oauth-personal" }, ambient, "linux")
+    for (const k of [
+      "GEMINI_API_KEY",
+      "GOOGLE_API_KEY",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_CLOUD_PROJECT",
+      "GOOGLE_CLOUD_LOCATION",
+      "GOOGLE_GENAI_USE_VERTEXAI",
+      "ANTIGRAVITY_ACP_API_KEY",
+    ]) {
+      expect(personal[k]).toBeUndefined()
+    }
+    expect(personal.OTHER).toBe("keep")
 
-    const platformEnv = buildAgySpawnEnv({
-      ANTIGRAVITY_ACP_AUTH_METHOD: "agent-platform",
-      GOOGLE_APPLICATION_CREDENTIALS: "/creds.json",
-    } as any)
-    expect(platformEnv.GOOGLE_APPLICATION_CREDENTIALS).toBe("/creds.json")
+    const key = buildAgySpawnEnv({ method: "gemini-api-key", apiKey: "selected" }, ambient, "linux")
+    expect(key.GEMINI_API_KEY).toBe("selected")
+    expect(key.GOOGLE_API_KEY).toBeUndefined()
 
-    // oauth-business is also a browser OAuth flow: ambient keys are scrubbed too.
-    const businessEnv = buildAgySpawnEnv({
-      ANTIGRAVITY_ACP_AUTH_METHOD: "oauth-business",
-      GEMINI_API_KEY: "k",
-      GOOGLE_API_KEY: "g",
-      GOOGLE_APPLICATION_CREDENTIALS: "/creds.json",
-    } as any)
-    expect(businessEnv.GEMINI_API_KEY).toBeUndefined()
-    expect(businessEnv.GOOGLE_API_KEY).toBeUndefined()
-    expect(businessEnv.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined()
+    const adc = buildAgySpawnEnv(
+      { method: "agent-platform", gcpProject: "proj", gcpLocation: "us-central1" },
+      ambient,
+      "linux",
+    )
+    expect(adc.GOOGLE_APPLICATION_CREDENTIALS).toBe("/creds.json")
+    expect(adc.GOOGLE_CLOUD_PROJECT).toBe("proj")
+    expect(adc.GOOGLE_CLOUD_LOCATION).toBe("us-central1")
+    expect(adc.GEMINI_API_KEY).toBeUndefined()
+
+    const platformKey = buildAgySpawnEnv({ method: "agent-platform", apiKey: "vertex-key" }, ambient, "linux")
+    expect(platformKey.GOOGLE_API_KEY).toBe("vertex-key")
+    expect(platformKey.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined()
+    expect(platformKey.GOOGLE_CLOUD_PROJECT).toBeUndefined()
+
+    const business = buildAgySpawnEnv(
+      { method: "oauth-business", gcpProject: "biz", gcpLocation: "global" },
+      ambient,
+      "linux",
+    )
+    expect(business.GOOGLE_CLOUD_PROJECT).toBe("biz")
+    expect(business.GEMINI_API_KEY).toBeUndefined()
   })
 
-  test("freshSession fallback sends a text handoff for prior ACP turns, thin for brand-new threads", async () => {
-    // Even when all prior turns were ACP-marked (no model switch), a fresh
-    // session/new after a failed resume owns no history — hand it off as text
-    // so the earlier conversation isn't silently lost.
+  test("a lost resume sends only the latest prompt and tells the user once", async () => {
     const acpPrompt = [
       { role: "user", content: [{ type: "text", text: "First ACP question" }] },
       {
@@ -1105,65 +1014,44 @@ describe("History sanitizer & cross-model context handoff", () => {
       { role: "user", content: [{ type: "text", text: "Follow-up in ACP" }] },
     ] as any
 
-    async function runWithFresh(freshSession: boolean) {
+    async function run(prompt: any, resumeLost: boolean) {
       const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
       let capturedPrompt: any[] | undefined
-      ;(bridge as any).ensureAcpSession = async (s: any) => {
-        const fakeProc = {
+      ;(bridge as any).ensureAcpSession = async () => ({
+        proc: {
           setModel: async () => {},
           setConfigOption: async () => {},
-          prompt: async (_sid: string, prompt: any[]) => {
-            capturedPrompt = prompt
+          prompt: async (_sid: string, p: any[]) => {
+            capturedPrompt = p
             return { stopReason: "end_turn" }
           },
-        }
-        return { proc: fakeProc, acpSessionId: "acp-fresh", freshSession }
-      }
+        },
+        acpSessionId: "acp-new",
+        resumeLost,
+      })
       const lm = bridge.createLanguageModel("gemini-4-neon")
-      const res = await lm.doStream({
-        prompt: acpPrompt,
-        headers: { "x-opencode-session-id": "fresh-sess" },
-      } as any)
+      const res = await lm.doStream({ prompt, headers: { "x-opencode-session-id": "resume-sess" } } as any)
       const parts = await readAllParts(res.stream)
-      expect(parts.some((p) => p.type === "error")).toBe(false)
-      expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
       await bridge.disposeAll()
-      return capturedPrompt as any[] | undefined
+      return { capturedPrompt, parts }
     }
 
-    const handoffPrompt = await runWithFresh(true)
-    expect(handoffPrompt).toBeDefined()
-    const handoffHead = handoffPrompt!.find((b) => b.type === "text")?.text ?? ""
-    expect(handoffHead).toContain(TEXT_ONLY_HANDOFF_HEADER)
-    expect(handoffHead).toContain("ACP answer one")
-    expect((handoffPrompt![handoffPrompt!.length - 1] as any).text).toBe("Follow-up in ACP")
+    const lost = await run(acpPrompt, true)
+    expect(lost.capturedPrompt).toEqual([{ type: "text", text: "Follow-up in ACP" }])
+    expect(JSON.stringify(lost.capturedPrompt)).not.toContain("ACP answer one")
+    const notice = lost.parts.filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
+    expect(notice).toContain(RESUME_LOST_NOTICE.trim())
+    const noticeStart = lost.parts.find((p) => p.type === "text-start")
+    expect(noticeStart?.providerMetadata?.["antigravity-acp"]?.localStatus).toBe(true)
 
-    // Brand-new conversation (single user turn, nothing prior): raw thin prompt.
-    const thinOnly = await (async () => {
-      const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
-      let capturedPrompt: any[] | undefined
-      ;(bridge as any).ensureAcpSession = async (s: any) => {
-        const fakeProc = {
-          setModel: async () => {},
-          setConfigOption: async () => {},
-          prompt: async (_sid: string, prompt: any[]) => {
-            capturedPrompt = prompt
-            return { stopReason: "end_turn" }
-          },
-        }
-        return { proc: fakeProc, acpSessionId: "acp-new", freshSession: true }
-      }
-      const lm = bridge.createLanguageModel("gemini-4-neon")
-      const res = await lm.doStream({
-        prompt: [{ role: "user", content: [{ type: "text", text: "Hello fresh thread" }] }],
-        headers: { "x-opencode-session-id": "brand-new" },
-      } as any)
-      await readAllParts(res.stream)
-      await bridge.disposeAll()
-      return capturedPrompt as any[] | undefined
-    })()
-    expect(thinOnly).toHaveLength(1)
-    expect((thinOnly![0] as any).text).toBe("Hello fresh thread")
+    // A brand-new conversation has nothing to lose: no notice.
+    const fresh = await run([{ role: "user", content: [{ type: "text", text: "Hello fresh thread" }] }], true)
+    expect(fresh.capturedPrompt).toEqual([{ type: "text", text: "Hello fresh thread" }])
+    expect(fresh.parts.some((p) => p.type === "text-delta")).toBe(false)
+
+    // A resumed session gets no notice either.
+    const resumed = await run(acpPrompt, false)
+    expect(resumed.parts.some((p) => p.type === "text-delta")).toBe(false)
   })
 
   test("concurrent starters join one in-flight start; invalidation yields exactly one retry install", async () => {
@@ -1233,79 +1121,6 @@ describe("History sanitizer & cross-model context handoff", () => {
     await bridge.disposeAll()
   })
 
-  test("setCodeMode during startup invalidates the stale start and re-ensures with the new mode", async () => {
-    const factoryCalls: any[][] = []
-    let openFirstInitialize!: () => void
-    const makeFakeProc = () => {
-      const callIndex = factoryCalls.length
-      const state = { disposed: false, newSessionServers: [] as any[], closed: false }
-      let resolveFirstInit!: () => void
-      const firstGate = new Promise<void>((r) => {
-        resolveFirstInit = r
-      })
-      if (callIndex === 0) openFirstInitialize = () => resolveFirstInit()
-      const fake: any = {
-        newSessionServers: state.newSessionServers,
-        get disposed() {
-          return state.disposed
-        },
-        get isClosed() {
-          return state.closed
-        },
-        // First start parks at initialize so the mode flip lands mid-startup;
-        // retries resolve immediately.
-        initialize: () => (callIndex === 0 ? firstGate : Promise.resolve()),
-        authenticate: async () => ({}),
-        newSession: async (params: any) => {
-          state.newSessionServers.push(params.mcpServers)
-          return { sessionId: `acp-${callIndex}` }
-        },
-        resumeSession: async (params: any) => ({ sessionId: params.sessionId }),
-        setMode: async () => {},
-        setConfigOption: async () => {},
-        closeSession: async () => {},
-        notifyCancel: () => {},
-        cancel: async () => {},
-        dispose: async () => {
-          state.disposed = true
-        },
-      }
-      factoryCalls.push([fake])
-      return fake
-    }
-
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
-      createProc: () => makeFakeProc(),
-    })
-    const s = (bridge as any).getOrCreateSession("race-sess")
-    expect(s.startGeneration).toBe(0)
-
-    // Kick off a startup with Code Mode off; it parks at initialize.
-    const startP = (bridge as any).ensureAcpSession(s)
-    await new Promise((r) => setTimeout(r, 20))
-    expect(factoryCalls.length).toBe(1)
-
-    // Flip the mode mid-startup: reset invalidates the in-flight start...
-    const modeP = bridge.setCodeMode("race-sess", true)
-    expect((bridge as any).getOrCreateSession("race-sess").startGeneration).toBe(1)
-    // ...then let the stale start proceed; it must dispose itself, not install.
-    openFirstInitialize()
-    await modeP
-    // The original ensure transparently retried and installed with the new mode.
-    const ensured = await startP
-    expect(factoryCalls[0][0].disposed).toBe(true)
-    expect(factoryCalls.length).toBe(2)
-    expect(ensured.acpSessionId).toBe("acp-1")
-    expect(factoryCalls[1][0].disposed).toBe(false)
-    // Retry installed with the NEW mode: single oc MCP server.
-    expect(factoryCalls[1][0].newSessionServers).toHaveLength(1)
-    expect(factoryCalls[1][0].newSessionServers[0]).toHaveLength(1)
-    expect(factoryCalls[1][0].newSessionServers[0][0].name).toBe("oc")
-    expect((bridge as any).getOrCreateSession("race-sess").proc).toBe(factoryCalls[1][0])
-    expect(bridge.getState("race-sess").codeModeEnabled).toBe(true)
-    await bridge.disposeAll()
-  })
-
   test("warmSession(sessionID) pre-warms so the first turn reuses it without a second spawn", async () => {
     const factoryCalls: any[] = []
     const makeFakeProc = () => {
@@ -1361,81 +1176,6 @@ describe("History sanitizer & cross-model context handoff", () => {
     expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
     expect(factoryCalls.length).toBe(1)
     expect(factoryCalls[0]._prompts).toHaveLength(1)
-    await bridge.disposeAll()
-  })
-
-  test("warmed empty tools/list refreshes on first real turn with same proc", async () => {
-    const newSessionCalls: any[] = []
-    let procInstance: any
-    const makeFakeProc = () => {
-      const state = { disposed: false, closed: false, prompts: [] as any[] }
-      const fake: any = {
-        get disposed() {
-          return state.disposed
-        },
-        get isClosed() {
-          return state.closed
-        },
-        initialize: async () => ({}),
-        authenticate: async () => ({}),
-        newSession: async (params: any) => {
-          newSessionCalls.push(params)
-          return { sessionId: `acp-sess-${newSessionCalls.length}` }
-        },
-        resumeSession: async (params: any) => ({ sessionId: params.sessionId }),
-        setModel: async () => {},
-        setMode: async () => {},
-        setConfigOption: async () => {},
-        closeSession: async () => {},
-        notifyCancel: () => {},
-        cancel: async () => {},
-        prompt: async (_sid: string, prompt: any[]) => {
-          state.prompts.push(prompt)
-          return { stopReason: "end_turn" }
-        },
-        dispose: async () => {
-          state.disposed = true
-          state.closed = true
-        },
-        _prompts: state.prompts,
-      }
-      procInstance = fake
-      return fake
-    }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
-      createProc: () => makeFakeProc(),
-    })
-
-    // Warm creates the ACP session before contextSnapshot exists (empty tools).
-    await bridge.warmSession("ses-tools-refresh")
-    await waitFor(() => (bridge as any).getOrCreateSession("ses-tools-refresh").proc !== undefined)
-    expect(newSessionCalls).toHaveLength(1)
-    expect(newSessionCalls[0].mcpServers).toHaveLength(1)
-    const warmedId = (bridge as any).getOrCreateSession("ses-tools-refresh").acpSessionId
-    expect(warmedId).toBe("acp-sess-1")
-
-    // First real turn populates the snapshot (context hook) with a real tool.
-    // updateContextSnapshot runs before doStream in the real plugin (index.ts).
-    bridge.updateContextSnapshot("ses-tools-refresh", {
-      systemText: "",
-      agent: "build",
-      tools: { mytool: { description: "r", input: { type: "object" } } },
-    })
-
-    const lm = bridge.createLanguageModel("gemini-4-neon")
-    const res = await lm.doStream({
-      prompt: [{ role: "user", content: [{ type: "text", text: "hello with tools" }] }],
-      headers: { "x-opencode-session-id": "ses-tools-refresh" },
-    } as any)
-    const parts = await readAllParts(res.stream)
-    expect(parts.some((p) => p.type === "error")).toBe(false)
-    expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
-    // Same proc reused (no extra spawn) but ACP session refreshed for tools.
-    expect(newSessionCalls).toHaveLength(2)
-    const refreshedId = (bridge as any).getOrCreateSession("ses-tools-refresh").acpSessionId
-    expect(refreshedId).toBe("acp-sess-2")
-    expect(refreshedId).not.toBe(warmedId)
-    expect((bridge as any).getOrCreateSession("ses-tools-refresh").proc).toBe(procInstance)
     await bridge.disposeAll()
   })
 
@@ -1677,8 +1417,13 @@ describe("History sanitizer & cross-model context handoff", () => {
 
     // Other pool proceeds immediately on the SAME live session.
     const lmGemini = bridge.createLanguageModel("gemini-4-hydrogen")
+    // OpenCode sends the accumulated history; the earlier messages are kept.
     const resOk = await lmGemini.doStream({
-      prompt: [{ role: "user", content: [{ type: "text", text: "hello gemini" }] }],
+      prompt: [
+        { role: "user", content: [{ type: "text", text: "hello claude" }] },
+        { role: "user", content: [{ type: "text", text: "hello sonnet" }] },
+        { role: "user", content: [{ type: "text", text: "hello gemini" }] },
+      ],
       headers: { "x-opencode-session-id": "ses-quota-1" },
     } as any)
     const okParts = await readAllParts(resOk.stream)
@@ -1804,7 +1549,7 @@ describe("History sanitizer & cross-model context handoff", () => {
   })
 })
 
-describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () => {
+describe("Session start races, resume and settling prompts", () => {
   const SESSION_KEY_PREFIX = "antigravity-acp:session:"
 
   function makeIdleFakeProc(onPrompt?: (prompt: any[]) => Promise<any>) {
@@ -1847,7 +1592,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     return fake
   }
 
-  test("finding 1: stale-start retry waits for reset cleanup before reading storage", async () => {
+  test("stale-start retry waits for reset cleanup before reading storage", async () => {
     const events: string[] = []
     const SESSION_ID = "ses-race-barrier"
     const SESSION_KEY = `${SESSION_KEY_PREFIX}${SESSION_ID}`
@@ -1938,7 +1683,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     await bridge.disposeAll()
   })
 
-  test("finding 2: concurrent cooldown loads share one in-flight read", async () => {
+  test("concurrent cooldown loads share one in-flight read", async () => {
     const getCalls: string[] = []
     let releaseReads!: () => void
     const readGate = new Promise<void>((r) => {
@@ -1976,7 +1721,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     await bridge.disposeAll()
   })
 
-  test("finding 3: idle warmed sessions are LRU-capped; active turns are never evicted", async () => {
+  test("idle warmed sessions are LRU-capped; active turns are never evicted", async () => {
     const factoryCalls: any[] = []
     const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
       createProc: () => {
@@ -2011,8 +1756,8 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     await bridge.disposeAll()
   })
 
-  test("finding 4: warm-installed fresh session triggers text handoff on first turn", async () => {
-    const SESSION_ID = "ses-handoff-warm"
+  test("a warm that loses the resume shows the notice on the first turn only", async () => {
+    const SESSION_ID = "ses-resume-warm"
     const ctx = makeMockCtx({ [`antigravity-acp:session:${SESSION_ID}`]: "acp-stale" })
     let captured: any[] | undefined
     const bridge = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
@@ -2029,8 +1774,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     })
     await bridge.warmSession(SESSION_ID)
     await waitFor(() => bridge.getState(SESSION_ID).connected)
-    // Resume failed during warm → fresh install armed the handoff flag.
-    expect((bridge as any).getOrCreateSession(SESSION_ID).pendingFreshHandoff).toBe(true)
+    expect((bridge as any).getOrCreateSession(SESSION_ID).pendingResumeLost).toBe(true)
 
     const acpPrompt = [
       { role: "user", content: [{ type: "text", text: "First ACP question" }] },
@@ -2045,42 +1789,30 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     const res = await lm.doStream({ prompt: acpPrompt, headers: { "x-opencode-session-id": SESSION_ID } } as any)
     const parts = await readAllParts(res.stream)
     expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
-    const head = (captured ?? []).find((b) => b.type === "text")?.text ?? ""
-    expect(head).toContain(TEXT_ONLY_HANDOFF_HEADER)
-    expect(head).toContain("First ACP question")
-    expect(head).toContain("ACP answer one")
-    expect((captured ?? [])[(captured ?? []).length - 1].text).toBe("Back to ACP now")
-    // The flag is consumed by the first real turn.
-    expect((bridge as any).getOrCreateSession(SESSION_ID).pendingFreshHandoff).toBeFalsy()
+    expect(captured).toEqual([{ type: "text", text: "Back to ACP now" }])
+    expect(parts.filter((p) => p.type === "text-delta").map((p) => p.delta).join("")).toContain(
+      RESUME_LOST_NOTICE.trim(),
+    )
+    expect((bridge as any).getOrCreateSession(SESSION_ID).pendingResumeLost).toBeFalsy()
+
+    // The second turn on the same session gets no notice.
+    const res2 = await lm.doStream({ prompt: acpPrompt, headers: { "x-opencode-session-id": SESSION_ID } } as any)
+    const parts2 = await readAllParts(res2.stream)
+    expect(parts2.some((p) => p.type === "text-delta")).toBe(false)
     await bridge.disposeAll()
 
-    // Control: resume succeeds → no flag, raw thin prompt.
-    let captured2: any[] | undefined
-    const ctx2 = makeMockCtx({ "antigravity-acp:session:ses-handoff-ok": "acp-live" })
+    // Control: resume succeeds, so there is no flag.
+    const ctx2 = makeMockCtx({ "antigravity-acp:session:ses-resume-ok": "acp-live" })
     const bridge2 = new SessionBridgeManager(ctx2, "/tmp/acp-test-dir", undefined, {
-      createProc: () => {
-        const fake = makeIdleFakeProc((prompt) => {
-          captured2 = prompt
-          return Promise.resolve({ stopReason: "end_turn" })
-        })
-        return fake as any
-      },
+      createProc: () => makeIdleFakeProc(() => Promise.resolve({ stopReason: "end_turn" })) as any,
     })
-    await bridge2.warmSession("ses-handoff-ok")
-    await waitFor(() => bridge2.getState("ses-handoff-ok").connected)
-    expect((bridge2 as any).getOrCreateSession("ses-handoff-ok").pendingFreshHandoff).toBeFalsy()
-    const lm2 = bridge2.createLanguageModel("gemini-4-neon")
-    const res2 = await lm2.doStream({
-      prompt: acpPrompt,
-      headers: { "x-opencode-session-id": "ses-handoff-ok" },
-    } as any)
-    await readAllParts(res2.stream)
-    expect(captured2).toHaveLength(1)
-    expect(JSON.stringify(captured2)).not.toContain(TEXT_ONLY_HANDOFF_HEADER)
+    await bridge2.warmSession("ses-resume-ok")
+    await waitFor(() => bridge2.getState("ses-resume-ok").connected)
+    expect((bridge2 as any).getOrCreateSession("ses-resume-ok").pendingResumeLost).toBeFalsy()
     await bridge2.disposeAll()
   })
 
-  test("finding 5: file parts accept data URIs and raw inline base64, reject URLs/paths/plain text", () => {
+  test("file parts accept data URIs and raw inline base64, reject URLs/paths/plain text", () => {
     const rawB64 = Buffer.from("x".repeat(48)).toString("base64")
     expect(rawB64.length % 4).toBe(0)
     const paddedB64 = Buffer.from("y".repeat(47)).toString("base64")
@@ -2116,7 +1848,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     expect(JSON.stringify(blocks)).not.toContain("https://example.com")
   })
 
-  test("finding 6: follow-up turn waits for a cancelled prompt to settle before sending a new prompt", async () => {
+  test("follow-up turn waits for a cancelled prompt to settle before sending a new prompt", async () => {
     const order: string[] = []
     let resolveFirst!: (v: any) => void
     const factoryCalls: any[] = []
@@ -2163,7 +1895,10 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     await waitFor(() => order.length === 1)
     // Turn 2 starts while turn 1's prompt is still unsettled server-side.
     const p2 = lm.doStream({
-      prompt: [{ role: "user", content: [{ type: "text", text: "two" }] }],
+      prompt: [
+        { role: "user", content: [{ type: "text", text: "one" }] },
+        { role: "user", content: [{ type: "text", text: "two" }] },
+      ],
       headers: { "x-opencode-session-id": sid },
     } as any)
     await new Promise((r) => setTimeout(r, 100))
@@ -2182,7 +1917,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     await bridge.disposeAll()
   })
 
-  test("finding 6: wedged prompt is torn down after the settle timeout so the next turn starts fresh", async () => {
+  test("wedged prompt is torn down after the settle timeout so the next turn starts fresh", async () => {
     const factoryCalls: any[] = []
     let promptCalls = 0
     const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
@@ -2246,7 +1981,7 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     await bridge.disposeAll()
   }, 15000)
 
-  test("finding 7: local status streams carry localStatus marker and never suppress handoff", async () => {
+  test("local status streams carry localStatus marker and don't lock the session", async () => {
     const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
     ;(bridge as any).tripCircuitBreaker("RESOURCE_EXHAUSTED (code 429)", "gemini")
     const lm = bridge.createLanguageModel("gemini-4-neon")
@@ -2262,10 +1997,8 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
       }
     }
     await bridge.disposeAll()
-    // A history containing only a localStatus-marked cooldown notice is skipped:
-    // neither a foreign handoff nor an ACP checkpoint.
     expect(
-      hasUnseenNonAcpAssistantHistory([
+      hasNonAcpAssistantHistory([
         { role: "user", content: [{ type: "text", text: "hello" }] },
         {
           role: "assistant",
@@ -2282,118 +2015,22 @@ describe("CodeRabbit review findings: races, handoffs, scrubbing, budgets", () =
     ).toBe(false)
   })
 
-  test("finding 10: context snapshot rebuilds when descriptions or schemas change", async () => {
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir")
-    await bridge.setCodeMode("sess-sig", true)
-    const inputA = {
-      description: "does A",
-      input: { type: "object", properties: { x: { type: "string" } } },
-    }
-    bridge.updateContextSnapshot("sess-sig", {
-      systemText: "",
-      agent: "build",
-      tools: { mytool: inputA },
-    } as any)
-    const snapA = (bridge as any).sessions.get("sess-sig").contextSnapshot
-    expect(snapA.mcpDescriptors).toHaveLength(1)
-    expect(snapA.mcpDescriptors[0].description).toBe("does A")
-    // Same keys, new description → must rebuild (old signature ignored it).
-    bridge.updateContextSnapshot("sess-sig", {
-      systemText: "",
-      agent: "build",
-      tools: { mytool: { description: "does B", input: inputA.input } },
-    } as any)
-    const snapB = (bridge as any).sessions.get("sess-sig").contextSnapshot
-    expect(snapB).not.toBe(snapA)
-    expect(snapB.mcpDescriptors[0].description).toBe("does B")
-    // Same keys + description, new schema → must rebuild.
-    const inputC = { type: "object", properties: { y: { type: "number" } } }
-    bridge.updateContextSnapshot("sess-sig", {
-      systemText: "",
-      agent: "build",
-      tools: { mytool: { description: "does B", input: inputC } },
-    } as any)
-    const snapC = (bridge as any).sessions.get("sess-sig").contextSnapshot
-    expect(snapC).not.toBe(snapB)
-    expect(snapC.mcpDescriptors[0].inputSchema).toEqual(inputC)
-    // Identical input → no rebuild (same snapshot object).
-    bridge.updateContextSnapshot("sess-sig", {
-      systemText: "",
-      agent: "build",
-      tools: { mytool: { description: "does B", input: inputC } },
-    } as any)
-    expect((bridge as any).sessions.get("sess-sig").contextSnapshot).toBe(snapC)
-    await bridge.disposeAll()
-  })
-
-  test("finding 11: buildAgySpawnEnv scrubs case-insensitively on win32 only", () => {
-    const src = {
-      ANTIGRAVITY_ACP_AUTH_METHOD: "oauth-personal",
-      gemini_api_key: "k",
-      GOOGLE_api_KEY: "g",
-      OTHER: "x",
-    } as any
-    const win = buildAgySpawnEnv(src, "win32")
+  test("buildAgySpawnEnv scrubs case-insensitively on win32 only", () => {
+    const src = { gemini_api_key: "a", Google_Api_Key: "b", GOOGLE_APPLICATION_CREDENTIALS: "c", OTHER: "keep" } as any
+    const win = buildAgySpawnEnv({ method: "oauth-personal" }, src, "win32")
     expect(win.gemini_api_key).toBeUndefined()
-    expect(win["GOOGLE_api_KEY"]).toBeUndefined()
-    expect(win.OTHER).toBe("x")
-    const nix = buildAgySpawnEnv(src, "linux")
-    // Exact match on Unix: mixed-case keys survive.
-    expect(nix.gemini_api_key).toBe("k")
-    expect(nix["GOOGLE_api_KEY"]).toBe("g")
-    // Non-OAuth methods are untouched even on win32.
-    const keyWin = buildAgySpawnEnv(
-      { ANTIGRAVITY_ACP_AUTH_METHOD: "gemini-api-key", gemini_api_key: "k" } as any,
-      "win32",
-    )
-    expect(keyWin.gemini_api_key).toBe("k")
+    expect(win.Google_Api_Key).toBeUndefined()
+    expect(win.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined()
+    expect(win.OTHER).toBe("keep")
+    const nix = buildAgySpawnEnv({ method: "oauth-personal" }, src, "linux")
+    expect(nix.gemini_api_key).toBe("a")
+    expect(nix.Google_Api_Key).toBe("b")
+    expect(nix.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined()
   })
 
-  test("finding 12: handoff block (excluding latest prompt) never exceeds maxChars", () => {
-    const userText = "y".repeat(400)
-    const longPrompt = "z".repeat(1000)
-    const blocks = buildTextOnlyHandoffPromptBlocks(
-      [
-        { role: "user", content: [{ type: "text", text: userText }] },
-        { role: "assistant", content: [{ type: "text", text: userText }] },
-        { role: "user", content: [{ type: "text", text: longPrompt }] },
-      ] as any,
-      { maxChars: 500 },
-    )
-    const head = (blocks[0] as any).text as string
-    expect(head.startsWith(TEXT_ONLY_HANDOFF_HEADER)).toBe(true)
-    expect(head.length).toBeLessThanOrEqual(500)
-    // Latest user prompt is exempt from the cap and intact.
-    expect((blocks[blocks.length - 1] as any).text).toBe(longPrompt)
-    // Single oversized line is truncated with the marker, still within budget.
-    const huge = "q".repeat(2000)
-    const capped = buildTextOnlyHandoffPromptBlocks(
-      [
-        { role: "user", content: [{ type: "text", text: "q?" }] },
-        { role: "assistant", content: [{ type: "text", text: huge }] },
-        { role: "user", content: [{ type: "text", text: "go" }] },
-      ] as any,
-      { maxChars: 300 },
-    )
-    const chead = (capped[0] as any).text as string
-    expect(chead).toContain("\n... [truncated]")
-    expect(chead.length).toBeLessThanOrEqual(300)
-    expect((capped[capped.length - 1] as any).text).toBe("go")
-    // Degenerate budget: no handoff block, just the live prompt.
-    const tiny = buildTextOnlyHandoffPromptBlocks(
-      [
-        { role: "user", content: [{ type: "text", text: "q?" }] },
-        { role: "assistant", content: [{ type: "text", text: huge }] },
-        { role: "user", content: [{ type: "text", text: "go" }] },
-      ] as any,
-      { maxChars: 10 },
-    )
-    expect(tiny).toHaveLength(1)
-    expect((tiny[0] as any).text).toBe("go")
-  })
 })
 
-describe("Remaining fixes regression", () => {
+describe("Inline file data, LRU eviction and local notices", () => {
   afterEach(() => {
     resetSharedCatalogForTests()
   })
@@ -2541,7 +2178,7 @@ describe("Remaining fixes regression", () => {
     await bridge.disposeAll()
   })
 
-  test("local cooldown notices create neither foreign handoff nor ACP checkpoint", async () => {
+  test("local notices never lock the session; another model's reply does", async () => {
     const local = (text: string) => ({
       role: "assistant",
       content: [
@@ -2559,24 +2196,18 @@ describe("Remaining fixes regression", () => {
     })
     const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] })
 
-    // Local-only: skipped entirely → no handoff.
-    expect(hasUnseenNonAcpAssistantHistory([user("hi"), local("cooldown 12s"), user("now?")] as any)).toBe(false)
-    // ACP + local: local is not a foreign turn → no handoff.
+    expect(hasNonAcpAssistantHistory([user("hi"), local("cooldown 12s"), user("now?")] as any)).toBe(false)
+    expect(hasNonAcpAssistantHistory([user("a"), acpReply("acp one"), local("cooldown"), user("b")] as any)).toBe(
+      false,
+    )
+    // A later Antigravity reply doesn't unlock a session another model answered in.
     expect(
-      hasUnseenNonAcpAssistantHistory([user("a"), acpReply("acp one"), local("cooldown"), user("b")] as any),
-    ).toBe(false)
-    // Foreign + local: real foreign turn still triggers handoff (local doesn't suppress it).
-    expect(
-      hasUnseenNonAcpAssistantHistory([user("a"), foreign("spark reply"), local("cooldown"), user("b")] as any),
-    ).toBe(true)
-    // Local must not count as an ACP checkpoint hiding an earlier foreign turn.
-    expect(
-      hasUnseenNonAcpAssistantHistory([user("a"), foreign("spark reply"), local("cooldown"), user("back")] as any),
+      hasNonAcpAssistantHistory([user("a"), foreign("spark reply"), acpReply("acp"), user("b")] as any),
     ).toBe(true)
   })
 })
 
-describe("CodeRabbit final 8 findings", () => {
+describe("Attachment decoding, cooldown rechecks and warm restarts", () => {
   test("fileData rejects path-shaped and bad data-URI payloads, accepts /9j/ JPEG", () => {
     const blocks = buildThinAcpPromptBlocks(
       [
@@ -2612,31 +2243,6 @@ describe("CodeRabbit final 8 findings", () => {
     expect(text).toContain("[Attached file: bad.png")
     expect(JSON.stringify(blocks)).not.toContain("/workspace/assets/screenshots/abcdef")
     expect(JSON.stringify(blocks)).not.toContain("not base64!")
-  })
-
-  test("buildTextOnlyHandoff skips localStatus assistant lines", () => {
-    const blocks = buildTextOnlyHandoffPromptBlocks(
-      [
-        { role: "user", content: [{ type: "text", text: "first q" }] },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "text",
-              text: "Antigravity ACP cooldown active (60s remaining)",
-              providerMetadata: { "antigravity-acp": { localStatus: true } },
-            },
-          ],
-        } as any,
-        { role: "assistant", content: [{ type: "text", text: "real foreign answer" }] } as any,
-        { role: "user", content: [{ type: "text", text: "continue in ACP" }] },
-      ] as any,
-    )
-    const head = (blocks[0] as any).text as string
-    expect(head).toContain(TEXT_ONLY_HANDOFF_HEADER)
-    expect(head).toContain("real foreign answer")
-    expect(head).not.toContain("cooldown active")
-    expect((blocks[blocks.length - 1] as any).text).toBe("continue in ACP")
   })
 
   test("cooldown recheck after settlingPrompt blocks tripped pool, other pools proceed", async () => {
@@ -2761,8 +2367,8 @@ describe("CodeRabbit final 8 findings", () => {
     await bridge.disposeAll()
   })
 
-  test("warmup pendingFreshHandoff survives simulated restart before turn 1", async () => {
-    const SESSION_ID = "ses-restart-handoff"
+  test("warmup pendingResumeLost survives simulated restart before turn 1", async () => {
+    const SESSION_ID = "ses-restart-resume"
     const SESSION_KEY = `antigravity-acp:session:${SESSION_ID}`
     const store = new Map<string, unknown>([[SESSION_KEY, "acp-stale-restart"]])
     const ctx: any = {
@@ -2802,13 +2408,13 @@ describe("CodeRabbit final 8 findings", () => {
     })
     await bridge1.warmSession(SESSION_ID)
     await waitFor(() => (bridge1 as any).getOrCreateSession(SESSION_ID).proc !== undefined)
-    expect((bridge1 as any).getOrCreateSession(SESSION_ID).pendingFreshHandoff).toBe(true)
+    expect((bridge1 as any).getOrCreateSession(SESSION_ID).pendingResumeLost).toBe(true)
     // Deferred persist: storage still holds the prior id, not the fresh one.
     expect(store.get(SESSION_KEY)).toBe("acp-stale-restart")
     await bridge1.disposeAll()
 
-    // Simulated restart: fresh manager, same storage. First real turn must
-    // still deliver prior history via handoff (resume fails again → fresh).
+    // Simulated restart: the first real turn retries the prior id, fails to
+    // resume again, and still tells the user, sending only the latest prompt.
     let captured: any[] | undefined
     const bridge2 = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
       createProc: () => {
@@ -2834,9 +2440,11 @@ describe("CodeRabbit final 8 findings", () => {
     const res = await lm.doStream({ prompt: acpPrompt, headers: { "x-opencode-session-id": SESSION_ID } } as any)
     const parts = await readAllParts(res.stream)
     expect(parts.find((p) => p.type === "finish")?.finishReason?.unified).toBe("stop")
-    const head = (captured ?? []).find((b) => b.type === "text")?.text ?? ""
-    expect(head).toContain(TEXT_ONLY_HANDOFF_HEADER)
-    expect(head).toContain("ACP answer one")
+    expect(captured).toEqual([{ type: "text", text: "Back to ACP now" }])
+    expect(parts.filter((p) => p.type === "text-delta").map((p) => p.delta).join("")).toContain(
+      RESUME_LOST_NOTICE.trim(),
+    )
+    expect(store.get(SESSION_KEY)).toBe("acp-fresh-restart")
     await bridge2.disposeAll()
   })
 })
@@ -2871,7 +2479,7 @@ describe("Token/context window usage reporting", () => {
     return { bridge, getOnUpdate: () => onUpdateRef }
   }
 
-  test("a) session/prompt usage wins over usage_update (used:0 and used=input+output)", async () => {
+  test("session/prompt usage wins over usage_update (used:0 and used=input+output)", async () => {
     const fullUsage = {
       inputTokens: 1000,
       outputTokens: 200,
@@ -2931,7 +2539,7 @@ describe("Token/context window usage reporting", () => {
     await bridge.disposeAll()
   })
 
-  test("b) usage_update used as fallback when prompt omits usage; used:0 ignored", async () => {
+  test("usage_update used as fallback when prompt omits usage; used:0 ignored", async () => {
     // Fallback: used > 0
     {
       const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
@@ -2966,7 +2574,7 @@ describe("Token/context window usage reporting", () => {
     }
   })
 
-  test("c) lastContextUsed cleared at start of new turn (no bleed into turn 2)", async () => {
+  test("lastContextUsed cleared at start of new turn (no bleed into turn 2)", async () => {
     let calls = 0
     const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
       calls++
@@ -2994,7 +2602,7 @@ describe("Token/context window usage reporting", () => {
     await bridge.disposeAll()
   })
 
-  test("d) finishTurnCleanStop preserves lastContextUsed after interrupt/error", async () => {
+  test("finishTurnCleanStop preserves lastContextUsed after interrupt/error", async () => {
     const { bridge } = makeUsageBridge((onUpdate) => async (sid: string) => {
       onUpdate?.(sid, { sessionUpdate: "usage_update", used: 7777 })
       throw new Error("API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Individual quota reached")
@@ -3138,11 +2746,7 @@ describe("Antigravity questions via OpenCode's question tool", () => {
         }) as any,
     })
     const SESSION = "ses-question"
-    bridge.updateContextSnapshot(SESSION, {
-      systemText: "",
-      agent: "build",
-      tools: withQuestionTool ? { question: { description: "Ask", input: {} } } : {},
-    })
+    bridge.updateContextSnapshot(SESSION, { agent: "build", hasQuestionTool: withQuestionTool })
     const lm = bridge.createLanguageModel("gemini-4-neon")
     const headers = { "x-opencode-session-id": SESSION }
     const user = { role: "user", content: [{ type: "text", text: "Ask me" }] }

@@ -8,6 +8,8 @@ It adds no card to Settings → Usage, so Antigravity no longer appears in OpenC
 
 It reads the quota from the Antigravity CLI's own `/quota` command (`agy -p "/quota" --output-format json`), with your existing `agy` login. It reads no tokens, calls no Google endpoint itself, and runs no model turn. Each read starts `agy` once (about 2 seconds); a good reading is reused for a minute.
 
+The plugin itself works like T3 Code, which doesn't show Antigravity's subscription quota. This extension is separate and optional: it runs `agy` headless from OpenChamber, which Google's FAQ describes as meant for direct scripting. Leave it out if you want only what T3 Code does. It reads the quota of the personal Google login only; with the API key or Agent Platform sign-in methods there is no Antigravity plan quota to show.
+
 ## Install
 
 1. Install and sign in to `agy` (`agy --version` works). If OpenChamber can't find it, set `AGY_BIN`; `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` are checked automatically.

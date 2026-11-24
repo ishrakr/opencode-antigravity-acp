@@ -33,9 +33,12 @@ Thanks for your interest in contributing!
 Pull requests **must** preserve these core invariants:
 
 - **Official ACP only:** Never extract OAuth tokens from Antigravity storage, spoof client headers, or call private Cloud Code HTTP endpoints directly.
-- **Strict context allowlist:** Keep `tools.opencode.*` / `session_move` stripped before prompts or MCP tool descriptions reach `agy acp`.
+- **Antigravity is the agent:** Never send OpenCode's system prompt, agents, skills or tools to `agy acp`, and never attach MCP servers to its sessions.
+- **No replay:** Send only the latest user message and its attachments. Never send earlier turns, and never hand `agy` a conversation another model took part in. The one exception is a rewind or edit in OpenCode: the replacement `agy` session gets the kept Antigravity conversation once (`src/rewind-guard.ts`).
+- **Selected sign-in only:** Use exactly the sign-in method the user configured. Never fall back to another method or read ambient `GEMINI_API_KEY` / `GOOGLE_*` credentials.
+- **Interactive turns only:** Don't send OpenCode's auxiliary requests (compaction, generate, title) to `agy`, and don't add automation that prompts `agy` without the user.
 - **Fail-fast on upstream errors:** Do not add automatic retry loops on `429` / quota / permission errors, and never emit retryable stream errors on plugin unload.
-- **Zero overhead for non-ACP models:** Do not eagerly spawn `agy acp`, bind `McpRelayServer`, or attach global SSE event streams when other OpenCode providers are in use.
+- **Zero overhead for non-ACP models:** Do not eagerly spawn `agy acp` or attach global SSE event streams when other OpenCode providers are in use.
 - **Keep `dist/gui-experimental.cjs` updated:** OpenCode loads the prebuilt CommonJS GUI bundle directly.
 
 ## Submitting Changes
@@ -49,7 +52,7 @@ Pull requests **must** preserve these core invariants:
 
 Releases publish to npm automatically — no tokens, no 2FA prompts:
 
-1. Bump the version in `package.json`, `src/acp-client.ts` (`clientInfo.version`), and `src/mcp-relay.ts` (`serverInfo.version`) so all three match.
+1. Bump the version in `package.json` and `src/acp-client.ts` (`clientInfo.version`) so both match.
 2. Commit, then tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z` (the tag must equal `package.json` `version`, or CI fails loudly).
 3. The `publish` workflow runs `typecheck` + `test` + `build:gui`, then `npm publish --provenance` via OIDC trusted publishing.
 

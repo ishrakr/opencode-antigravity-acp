@@ -1,13 +1,13 @@
 import { Plugin } from "@opencode/plugin/effect"
 import { Effect, Stream } from "effect"
-import type { AcpDiscoveredModel } from "./acp-client.js"
+import { isLegacyAcpModel, resolveAcpAuthConfig, type AcpDiscoveredModel } from "./acp-client.js"
 import {
   ACP_PROVIDER_ID,
   sanitizeForAcpModel,
   sanitizeForNonAcpModel,
 } from "./history-sanitizer.js"
 import { AcpRpc } from "./rpc.js"
-import { SessionBridgeManager } from "./session-bridge.js"
+import { ANTIGRAVITY_WARNING_METADATA_KEY, SessionBridgeManager } from "./session-bridge.js"
 
 function buildModelEntries(models: readonly AcpDiscoveredModel[], bridgeGeneration: string): any[] {
   return models.map((m) => ({
@@ -27,13 +27,14 @@ function buildModelEntries(models: readonly AcpDiscoveredModel[], bridgeGenerati
     settings: { antigravityBridgeGeneration: bridgeGeneration },
     capabilities: {
       tools: true,
-      input: ["text", "image"],
+      // PDFs are linked and text files embedded; agy declines audio.
+      input: ["text", "image", "pdf"],
       output: ["text"],
     },
     variants: m.variants.map((v) => ({ id: v.id })),
     time: { released: 0 },
     cost: [],
-    status: "active",
+    status: isLegacyAcpModel(m.id) ? "deprecated" : "active",
     enabled: true,
     limit: {
       context: 1048576,
@@ -62,7 +63,11 @@ export default Plugin.define({
   effect: (ctx) =>
     Effect.gen(function* () {
       const bridgeGeneration = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      // An invalid sign-in setting stops the plugin from loading instead of
+      // silently using a different method.
+      const auth = yield* Effect.try(() => resolveAcpAuthConfig(ctx.options))
       const bridge = new SessionBridgeManager(ctx, ctx.location.directory, undefined, {
+        auth,
         onCatalogChanged: () => {
           Effect.runFork(ctx.provider.reload().pipe(Effect.catch(() => Effect.void)))
         },
@@ -109,30 +114,20 @@ export default Plugin.define({
         { providerID: ACP_PROVIDER_ID as any },
       )
 
-      // Thin ACP: zero outer-harness prompt injection. Snapshot the live tool
-      // catalog for the Code Mode MCP relay (default), then always clear outer
-      // system instructions. `input.tools` is preserved in Code Mode so
-      // `mcp_oc_*` round-trips are permitted, cleared (`{}`) in Pure ACP
-      // opt-out (schemas are never injected either way).
+      // Antigravity is the agent: OpenCode's system prompt and tools never
+      // reach agy. Only OpenCode's `question` tool stays, so a question agy
+      // asks can be shown to the user and answered.
       yield* ctx.session.hook("context", (input) =>
         Effect.sync(() => {
           if (input.model.providerID === ACP_PROVIDER_ID) {
             sanitizeForAcpModel(input.messages as any[])
+            const question = input.tools.question
             bridge.updateContextSnapshot(input.sessionID, {
-              systemText: "",
               agent: input.agent,
-              tools: input.tools,
+              hasQuestionTool: question !== undefined,
             })
             input.system = []
-            // Only clear OpenCode's request tool allowlist in Pure ACP mode;
-            // when + Code Mode is enabled, OpenCode needs `input.tools` intact
-            // so `mcp_oc_*` tool-call round-trips (e.g. `execute`) are permitted
-            // (our `doStream` ignores `options.tools` and never injects schemas).
-            // Pure ACP still keeps `question` so agy's ask_question can be answered.
-            if (!bridge.getState(input.sessionID).codeModeEnabled) {
-              const question = input.tools.question
-              input.tools = question ? { question } : {}
-            }
+            input.tools = question ? { question } : {}
           } else {
             sanitizeForNonAcpModel(input.messages as any[])
           }
@@ -164,6 +159,30 @@ export default Plugin.define({
         { providerID: ACP_PROVIDER_ID as any },
       )
 
+      // Antigravity manages its own context. OpenCode's compaction would
+      // otherwise send a summarization prompt to agy as a user turn.
+      yield* ctx.session.hook(
+        "compaction",
+        (input) =>
+          Effect.sync(() => {
+            if (input.result) return
+            input.result = {
+              summary: "Antigravity keeps its own conversation history; send /compact to compact it.",
+            }
+          }),
+        { providerID: ACP_PROVIDER_ID as any },
+      )
+
+      // Show agy's warning on an approval that offers "Allow always".
+      yield* ctx.permission.hook("evaluate", (event) =>
+        Effect.sync(() => {
+          const warning = event.metadata?.[ANTIGRAVITY_WARNING_METADATA_KEY]
+          if (event.action.startsWith("antigravity.") && typeof warning === "string" && warning) {
+            event.message = event.message ? `${event.message}\n\n${warning}` : warning
+          }
+        }),
+      )
+
       yield* ctx.rpc.register(AcpRpc, {
         getState: (input) => {
           const { sessionID } = input as { sessionID: string }
@@ -175,13 +194,6 @@ export default Plugin.define({
             mode: "auto" | "accept-edits" | "default" | "plan"
           }
           return Effect.promise(() => bridge.setMode(sessionID, mode))
-        },
-        setCodeMode: (input) => {
-          const { sessionID, codeModeEnabled } = input as {
-            sessionID: string
-            codeModeEnabled: boolean
-          }
-          return Effect.promise(() => bridge.setCodeMode(sessionID, codeModeEnabled))
         },
         resetSession: (input) => {
           const { sessionID } = input as { sessionID: string }
@@ -239,6 +251,7 @@ export default Plugin.define({
       yield* Effect.logInfo("Antigravity ACP plugin loaded", {
         directory: ctx.location.directory,
         models: bridge.getModels().length,
+        authMethod: auth.method,
       })
     }).pipe(Effect.orDie),
 })

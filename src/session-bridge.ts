@@ -7,13 +7,21 @@ import type {
 } from "@ai-sdk/provider"
 import type { Plugin } from "@opencode/plugin/effect"
 import { Effect } from "effect"
+import { randomBytes } from "node:crypto"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { pathToFileURL } from "node:url"
 import {
   AcpProcess,
   AgyNotFoundError,
   FALLBACK_MODELS,
+  authMethodLabel,
   buildModelCatalog,
   discoverAcpModels,
   resolveAcpModelTarget,
+  UnavailableModelError,
+  type AcpAuthConfig,
   type AcpDiscoveredModel,
   type AcpElicitationRequestParams,
   type AcpElicitationResponse,
@@ -26,13 +34,19 @@ import {
 import {
   ACP_PROVIDER_ID,
   API_ERROR_ABORT_PATTERN,
-  buildTextOnlyHandoffPromptBlocks,
   buildThinAcpPromptBlocks,
   extractToolResultsFromPrompt,
-  hasUnseenNonAcpAssistantHistory,
+  hasNonAcpAssistantHistory,
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
-import { McpRelayServer, type McpCallToolResult, type McpToolDescriptor } from "./mcp-relay.js"
+import {
+  buildKeptConversation,
+  historyDiverged,
+  isDeliveredTurns,
+  readTurnHistory,
+  recordDelivery,
+  type DeliveredTurns,
+} from "./rewind-guard.js"
 import { describeAcpToolCall, describeAcpToolResult } from "./tool-display.js"
 import {
   elicitationToQuestions,
@@ -58,64 +72,80 @@ class PluginDisposedError extends Error {
 
 /**
  * Thrown when an in-flight `ensureAcpSession` start is invalidated by a
- * concurrent `setCodeMode()` / `resetSession()` (mode flip or generation bump).
- * The stale proc is disposed without being installed; the caller retries once
- * with the current mode.
+ * concurrent `resetSession()` (generation bump). The stale proc is disposed
+ * without being installed; a foreground caller retries once.
  */
 class StaleAcpStartError extends Error {
   constructor() {
-    super("ACP session start superseded by a mode change; retrying")
+    super("ACP session start superseded by a reset; retrying")
     this.name = "StaleAcpStartError"
   }
 }
 
-const NATIVE_SHADOWED_TOOLS = new Set([
-  "read",
-  "write",
-  "edit",
-  "multiedit",
-  "apply_patch",
-  "bash",
-  "shell",
-  "grep",
-  "glob",
-  "ls",
-  "list",
-  // agy's own ask_question is bridged to this tool, so don't offer it twice.
-  OPENCODE_QUESTION_TOOL,
-])
-
+/** What the bridge keeps from OpenCode's request context: never sent to agy. */
 export interface SessionContextSnapshot {
-  readonly systemText: string
   readonly agent: string
-  readonly toolSignature: string
-  readonly tools: Record<string, { readonly description: string; readonly input: any }>
-  readonly mcpSafeToOriginal: Map<string, string>
-  readonly mcpDescriptors: McpToolDescriptor[]
+  /** OpenCode's question tool is available to show agy's questions to the user. */
+  readonly hasQuestionTool: boolean
 }
 
 export interface SessionPublicState {
   readonly sessionID: string
   readonly mode: AcpMode
-  readonly codeModeEnabled: boolean
+  /** The selected sign-in method's label, such as "Google account". */
+  readonly authMethod: string
   readonly starting: boolean
   readonly acpSessionId: string | null
   readonly connected: boolean
   readonly busy: boolean
   readonly modelCount: number
-  readonly relayedToolCount: number
   readonly lastError: string | null
   readonly cooldownUntil: number | null
 }
 
-interface PendingMcpCall {
+/** Shown when a session already holds turns from a model outside Antigravity. */
+export const FOREIGN_HISTORY_MESSAGE =
+  "This session already has replies from another model. Antigravity only continues its own conversations, so it won't read them. Start a new session to use Antigravity."
+
+/** Permission metadata key holding agy's warning for an "Allow always" choice. */
+export const ANTIGRAVITY_WARNING_METADATA_KEY = "antigravityWarning"
+
+const SECURITY_WARNING_META_KEY = "agy.security.warning"
+const WARNING_TEXT_LIMIT = 512
+
+/** agy's warning for an Allow Always option (`_meta["agy.security.warning"]`), bounded like T3 Code. */
+export function antigravitySecurityWarning(option: { readonly _meta?: unknown }): string | undefined {
+  const meta = option._meta
+  if (!meta || typeof meta !== "object") return undefined
+  const raw = (meta as Record<string, unknown>)[SECURITY_WARNING_META_KEY]
+  if (!raw || typeof raw !== "object") return undefined
+  const { title, message } = raw as { title?: unknown; message?: unknown }
+  const text = (typeof message === "string" ? message.trim() : "") || (typeof title === "string" ? title.trim() : "")
+  if (!text) return undefined
+  return text.length > WARNING_TEXT_LIMIT ? `${text.slice(0, WARNING_TEXT_LIMIT - 3)}...` : text
+}
+
+/** Shown when OpenCode's history was rewound or edited behind agy's session. */
+export const REWIND_NOTICE =
+  "Messages in this session were rewound or edited, so Antigravity started a new session and was given the conversation that was kept.\n\n"
+
+/** Shown once when agy could not resume the session's earlier conversation. */
+export const RESUME_LOST_NOTICE =
+  "Antigravity could not resume the earlier conversation in this session, so it started a new one and doesn't see the earlier messages. Start a new session to keep the conversation in one place.\n\n"
+
+interface ToolResultForAgy {
+  readonly content: Array<{ readonly type: "text"; readonly text: string }>
+  readonly isError?: boolean
+}
+
+/** A question from agy shown to the user through OpenCode's question tool. */
+interface PendingQuestion {
   readonly toolCallId: string
-  readonly mcpName: string
   readonly openCodeToolName: string
   readonly args: unknown
   emittedToOpenCode: boolean
   resolved: boolean
-  readonly resolve: (res: McpCallToolResult) => void
+  readonly resolve: (res: ToolResultForAgy) => void
   abortCleanup?: () => void
   /** agy's own pending ask_question call, closed when the question is shown. */
   readonly nativeToolCallId?: string
@@ -138,7 +168,7 @@ interface ActiveTurn {
   /** Searchable title/name/input of native tool calls, to find agy's ask_question call. */
   nativeToolText?: Map<string, string>
   readonly relayedUpdateIds: Set<string>
-  readonly pendingMcpCalls: Map<string, PendingMcpCall>
+  readonly pendingQuestions: Map<string, PendingQuestion>
   readonly dispatchedCallIds: Set<string>
   flushTimer?: ReturnType<typeof setTimeout>
   promptSettled: boolean
@@ -151,7 +181,6 @@ interface BridgeSession {
   readonly sessionID: string
   cwd: string
   mode: AcpMode
-  codeModeEnabled: boolean
   acpSessionId?: string
   proc?: AcpProcess
   lastModelId?: string
@@ -170,11 +199,11 @@ interface BridgeSession {
    */
   resetLock?: Promise<void>
   /**
-   * Set when a fresh `agy acp` session is installed while the OpenCode thread
-   * already has prior turns (e.g. resume failed during a background warm).
-   * Consumed by the next real turn, which restores context via text handoff.
+   * Set when resuming the stored agy session failed and a new one replaced it
+   * during a background warm. The next real turn tells the user the earlier
+   * conversation is gone; it is never replayed into agy.
    */
-  pendingFreshHandoff?: boolean
+  pendingResumeLost?: boolean
   /**
    * Settles when the latest `proc.prompt()` so a follow-up turn can wait for a
    * cancelled prompt to settle server-side before sending a new prompt on
@@ -184,14 +213,6 @@ interface BridgeSession {
   /** Foreground reservations held by live doStream turns (excluded from idle LRU). */
   foregroundCount?: number
   lastContextUsed?: number
-  /**
-   * Signature of the MCP tool set actually served to `acpSessionId` at
-   * session/new time (`agy acp` fetches `tools/list` once and caches it).
-   * Compared against the live snapshot in `ensureAcpSession` so a warmed
-   * empty-list session (or a mid-session tool change) forces a fresh ACP
-   * session instead of reusing a stale 0-tool id.
-   */
-  acpToolsSignature?: string
 }
 
 interface WarmSpare {
@@ -200,7 +221,18 @@ interface WarmSpare {
   holder: { owner?: BridgeSession }
 }
 
+/** Where PDFs are copied for agy to read, like T3 Code's attachments folder. */
+function defaultAttachmentsDir(): string {
+  const stateHome = process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state")
+  return path.join(stateHome, "opencode-antigravity-acp", "attachments")
+}
+
+function sessionAttachmentsDir(root: string, sessionID: string): string {
+  return path.join(root, sessionID.replace(/[^A-Za-z0-9_-]/g, "_"))
+}
+
 const STORAGE_KEY_PREFIX = "antigravity-acp:session:"
+const DELIVERED_TURNS_KEY_PREFIX = "antigravity-acp:turns:"
 const COOLDOWN_STORAGE_KEY = "antigravity-acp:cooldown"
 const MODEL_CATALOG_STORAGE_KEY = "antigravity-acp:model-catalog:v1"
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000
@@ -357,66 +389,8 @@ function buildUsage(
   }
 }
 
-function sanitizeMcpToolName(name: string, used: Set<string>): string {
-  let base = name.replace(/[^a-zA-Z0-9_-]/g, "_")
-  if (!base) base = "tool"
-  let candidate = base
-  let n = 2
-  while (used.has(candidate)) {
-    candidate = `${base}_${n++}`
-  }
-  used.add(candidate)
-  return candidate
-}
-
-function enrichMcpToolDescription(toolName: string, rawDescription: string): string {
-  const base = rawDescription.trim() || `OpenCode tool: ${toolName}`
-  if (toolName === "subagent") {
-    return `${base}\n\nOpenCode agents include "explore" (read-only search/review), "general", "build", and "plan". Optional \`model\` uses "<provider>/<modelID>" (run \`opencode models\` only if you need to look up an exact model ID).`
-  }
-  if (toolName === "execute") {
-    return `${base}\n\nOpenCode Code Mode JavaScript runtime: call \`await tools.<namespace>.<tool>(...)\` or \`await search({ query })\` to inspect hidden MCP and workspace tool namespaces.`
-  }
-  return base
-}
-
-function buildDescriptors(
-  tools: Record<string, { readonly description: string; readonly input: any }>,
-  includeNativeShadowed: boolean,
-): { mcpDescriptors: McpToolDescriptor[]; mcpSafeToOriginal: Map<string, string> } {
-  const used = new Set<string>()
-  const mcpSafeToOriginal = new Map<string, string>()
-  const mcpDescriptors: McpToolDescriptor[] = []
-
-  for (const [toolName, info] of Object.entries(tools)) {
-    if (toolName === ACP_PROVIDER_ID) continue
-    if (!includeNativeShadowed && NATIVE_SHADOWED_TOOLS.has(toolName)) continue
-    const safeName = sanitizeMcpToolName(toolName, used)
-    mcpSafeToOriginal.set(safeName, toolName)
-    mcpDescriptors.push({
-      name: safeName,
-      description: enrichMcpToolDescription(toolName, info.description || ""),
-      inputSchema: info.input,
-    })
-  }
-  return { mcpDescriptors, mcpSafeToOriginal }
-}
-
-/**
- * Signature of the MCP tool set that `agy acp` actually sees for a session
- * (`tools/list` is fetched once at session/new and cached per acpSessionId).
- * Pure ACP is a constant; Code Mode fingerprints the live snapshot so a
- * warmed empty-list session or a mid-session tool change is detectable.
- */
-function acpToolsSignatureFor(s: BridgeSession): string {
-  if (!s.codeModeEnabled) return "pure"
-  const snap = s.contextSnapshot
-  if (!snap) return "code:__missing__"
-  return `code:${snap.toolSignature}`
-}
-
 export class SessionBridgeManager {
-  readonly mcpRelay: McpRelayServer
+  readonly auth: AcpAuthConfig
   private sessions = new Map<string, BridgeSession>()
   private catalog: readonly AcpDiscoveredModel[] = FALLBACK_MODELS
   private onStateChanged?: (sessionID: string) => void
@@ -437,6 +411,7 @@ export class SessionBridgeManager {
    * unbounded idle `agy acp` children.
    */
   private warmedIdleSessions: string[] = []
+  private readonly attachmentsDir: string
 
   constructor(
     private readonly ctx: Plugin.Context,
@@ -447,38 +422,58 @@ export class SessionBridgeManager {
       readonly discoverModels?: (cwd: string) => Promise<readonly AcpDiscoveredModel[]>
       /** Injectable proc factory for tests; defaults to real `AcpProcess`. */
       readonly createProc?: (options: AcpProcessOptions) => AcpProcess
+      /** The selected sign-in method; the personal Google account when omitted. */
+      readonly auth?: AcpAuthConfig
+      /** Folder for attachments agy reads from disk (PDFs); passed with --add-dir. */
+      readonly attachmentsDir?: string
     },
   ) {
+    this.auth = options?.auth ?? { method: "oauth-personal" }
+    this.attachmentsDir = options?.attachmentsDir ?? defaultAttachmentsDir()
     this.onStateChanged = onStateChanged
     this.onCatalogChanged = options?.onCatalogChanged
-    this.discoverModelsFn = options?.discoverModels ?? ((cwd) => discoverAcpModels(cwd))
-    this.createProcFn = options?.createProc ?? ((opts) => new AcpProcess(opts))
+    this.discoverModelsFn =
+      options?.discoverModels ?? ((cwd) => discoverAcpModels(cwd, { auth: this.auth }))
+    const createProc = options?.createProc ?? ((opts: AcpProcessOptions) => new AcpProcess(opts))
+    this.createProcFn = (opts) => {
+      try {
+        fs.mkdirSync(this.attachmentsDir, { recursive: true, mode: 0o700 })
+      } catch {}
+      return createProc({
+        ...opts,
+        auth: this.auth,
+        extraDirs: [...(opts.extraDirs ?? []), this.attachmentsDir],
+      })
+    }
     if (sharedCatalog && sharedCatalog.length > 0) {
       this.catalog = sharedCatalog
-    }
-    this.mcpRelay = new McpRelayServer({
-      getTools: (sessionID) => {
-        const s = this.sessions.get(sessionID)
-        return s?.contextSnapshot?.mcpDescriptors ?? []
-      },
-      callTool: (sessionID, toolName, args, signal) =>
-        this.handleIncomingMcpCall(sessionID, toolName, args, signal),
-    })
-  }
-
-  async start(): Promise<void> {
-    // Lazy: only start the loopback relay when at least one session has
-    // Code Mode enabled. Pure ACP opt-out sessions never need it.
-    for (const s of this.sessions.values()) {
-      if (s.codeModeEnabled) {
-        await this.mcpRelay.start()
-        return
-      }
     }
   }
 
   getModels(): readonly AcpDiscoveredModel[] {
     return this.catalog
+  }
+
+  /** Stores a PDF for agy under this session's attachment folder; returns its file URI. */
+  private storeAttachment(
+    sessionID: string,
+    input: { readonly bytes: Uint8Array; readonly filename: string },
+  ): string {
+    const dir = sessionAttachmentsDir(this.attachmentsDir, sessionID)
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const safeName = input.filename.replace(/[^A-Za-z0-9._ -]/g, "_").replace(/^\.+/, "") || "attachment"
+    const file = path.join(dir, `${randomBytes(6).toString("hex")}-${safeName}`)
+    fs.writeFileSync(file, input.bytes, { mode: 0o600, flag: "wx" })
+    return pathToFileURL(file).href
+  }
+
+  private async removeSessionAttachments(sessionID: string): Promise<void> {
+    try {
+      await fs.promises.rm(sessionAttachmentsDir(this.attachmentsDir, sessionID), {
+        recursive: true,
+        force: true,
+      })
+    } catch {}
   }
 
   async loadCachedModels(): Promise<{ readonly stale: boolean; readonly changed: boolean }> {
@@ -673,7 +668,6 @@ export class SessionBridgeManager {
         sessionID,
         cwd: this.defaultCwd,
         mode: "auto",
-        codeModeEnabled: true,
         lastError: null,
         startGeneration: 0,
       }
@@ -684,48 +678,10 @@ export class SessionBridgeManager {
 
   updateContextSnapshot(
     sessionID: string,
-    input: {
-      readonly systemText: string
-      readonly agent: string
-      readonly tools: Record<string, { readonly description: string; readonly input: any }>
-    },
+    input: { readonly agent: string; readonly hasQuestionTool: boolean },
   ): void {
     const s = this.getOrCreateSession(sessionID)
-    // Fingerprint keys AND descriptions AND schemas: a same-keyed tool whose
-    // description or input schema changed must rebuild the descriptors.
-    const toolSignature = Object.entries(input.tools)
-      .map(([name, info]) => {
-        let schema: string
-        try {
-          const stringified = JSON.stringify(info.input ?? null)
-          schema = typeof stringified === "string" ? stringified : String(typeof info.input)
-        } catch {
-          schema = String(typeof info.input)
-        }
-        return `${name}\0${info.description ?? ""}\0${schema}`
-      })
-      .sort()
-      .join("\0")
-    const prev = s.contextSnapshot
-    if (
-      prev &&
-      prev.systemText === input.systemText &&
-      prev.agent === input.agent &&
-      prev.toolSignature === toolSignature
-    ) {
-      return
-    }
-    const { mcpDescriptors, mcpSafeToOriginal } = s.codeModeEnabled
-      ? buildDescriptors(input.tools, false)
-      : { mcpDescriptors: [], mcpSafeToOriginal: new Map<string, string>() }
-    s.contextSnapshot = {
-      systemText: input.systemText,
-      agent: input.agent,
-      toolSignature,
-      tools: input.tools,
-      mcpDescriptors,
-      mcpSafeToOriginal,
-    }
+    s.contextSnapshot = { agent: input.agent, hasQuestionTool: input.hasQuestionTool }
   }
 
   isCircuitOpen(): boolean {
@@ -743,11 +699,6 @@ export class SessionBridgeManager {
    * a spare initialized + authenticated proc is parked for the first real
    * `ses_...` session to claim. Never throws — the foreground turn surfaces
    * and retries any failure itself.
-   *
-   * Note: a warm may create the ACP session before `contextSnapshot` exists,
-   * so `agy acp` caches an empty `tools/list`. The first real turn detects
-   * the signature mismatch in `ensureAcpSession` and refreshes the session
-   * on the same proc (no extra spawn) with the correct tools.
    */
   async warmSession(sessionID?: string): Promise<SessionPublicState> {
     if (this.disposed) return this.getState(sessionID ?? "")
@@ -761,9 +712,9 @@ export class SessionBridgeManager {
         // Pre-warm in the background; a real turn joins via startLock or reuses the install.
         // No retry on stale: if a reset invalidates this warm, it stays torn
         // down (the foreground turn re-warms on demand) instead of eagerly
-        // reinstalling behind the reset. markFreshHandoff arms the text-handoff
-        // restore in case resume fails and the fresh session owns no history.
-        void this.ensureAcpSession(s, { retryOnStale: false, markFreshHandoff: true })
+        // reinstalling behind the reset. markResumeLost lets the next real turn
+        // tell the user when resume failed and the new session has no history.
+        void this.ensureAcpSession(s, { retryOnStale: false, markResumeLost: true })
           .then(() => this.trackWarmedIdle(sessionID))
           .catch(() => {})
       }
@@ -890,13 +841,12 @@ export class SessionBridgeManager {
     return {
       sessionID,
       mode: s?.mode ?? "auto",
-      codeModeEnabled: s?.codeModeEnabled ?? true,
+      authMethod: authMethodLabel(this.auth.method),
       starting: Boolean(s?.startLock),
       acpSessionId: s?.acpSessionId ?? null,
       connected: Boolean(s?.proc && !s.proc.isClosed && s.acpSessionId),
       busy: Boolean(s?.activeTurn),
       modelCount: this.catalog.length,
-      relayedToolCount: s?.contextSnapshot?.mcpDescriptors.length ?? 0,
       lastError: s?.lastError ?? null,
       cooldownUntil: this.activeCooldownForSession(s)?.until ?? null,
     }
@@ -914,24 +864,6 @@ export class SessionBridgeManager {
       }
     }
     this.notifyChanged(sessionID)
-    return this.getState(sessionID)
-  }
-
-  async setCodeMode(sessionID: string, codeModeEnabled: boolean): Promise<SessionPublicState> {
-    const s = this.getOrCreateSession(sessionID)
-    s.codeModeEnabled = codeModeEnabled
-    if (s.contextSnapshot) {
-      const { mcpDescriptors, mcpSafeToOriginal } = codeModeEnabled
-        ? buildDescriptors(s.contextSnapshot.tools, false)
-        : { mcpDescriptors: [], mcpSafeToOriginal: new Map<string, string>() }
-      s.contextSnapshot = {
-        ...s.contextSnapshot,
-        mcpDescriptors,
-        mcpSafeToOriginal,
-      }
-    }
-    // Reset ACP session so agy re-fetches MCP tools/list cleanly on next turn
-    await this.resetSession(sessionID)
     return this.getState(sessionID)
   }
 
@@ -959,10 +891,8 @@ export class SessionBridgeManager {
         }
         // Invalidate any in-flight ensureAcpSession start, then wait for it to
         // settle so it cannot install a stale proc after we clean up.
-        // Note: a foreground turn already awaiting ensureAcpSession transparently
-        // retries after this reset and installs with the current mode (seamless
-        // setCodeMode handoff) — that post-reset install is by design. Background
-        // warms never retry, so a user reset during a pure warm stays torn down.
+        // A foreground turn already awaiting ensureAcpSession retries after
+        // this reset; background warms never retry, so a reset stays torn down.
         s.startGeneration++
         const inFlight = s.startLock
         if (inFlight) {
@@ -982,15 +912,15 @@ export class SessionBridgeManager {
           this.activeProcs.delete(proc)
         }
         s.acpSessionId = undefined
-        s.acpToolsSignature = undefined
         s.lastModelId = undefined
         s.lastModeApplied = undefined
         s.lastError = null
-        s.pendingFreshHandoff = undefined
+        s.pendingResumeLost = undefined
         s.settlingPrompt = undefined
         s.lastContextUsed = undefined
         this.untrackWarmedIdle(sessionID)
         await this.runStorageRemove(sessionID)
+        await this.removeSessionAttachments(sessionID)
       } finally {
         if (s.resetLock === resetGate) s.resetLock = undefined
         releaseReset()
@@ -1009,91 +939,6 @@ export class SessionBridgeManager {
     this.notifyChanged(sessionID)
   }
 
-  /**
-   * Soft reset for model-switch handoffs: closes the old ACP session
-   * server-side but KEEPS the live `agy` proc (no respawn, no re-auth).
-   * The next turn creates a fresh ACP session on the same proc with the
-   * current tools and restores history via the plain-text handoff.
-   * Full `resetSession` (proc dispose) remains for user resets, mode flips,
-   * and error recovery.
-   */
-  async softResetForHandoff(sessionID: string): Promise<SessionPublicState> {
-    const s = this.sessions.get(sessionID)
-    if (s) {
-      let releaseReset!: () => void
-      const resetGate = new Promise<void>((r) => {
-        releaseReset = r
-      })
-      const prevReset = s.resetLock
-      s.resetLock = resetGate
-      this.untrackWarmedIdle(sessionID)
-      try {
-        if (prevReset) {
-          try {
-            await prevReset
-          } catch {}
-        }
-        s.startGeneration++
-        const inFlight = s.startLock
-        if (inFlight) {
-          try {
-            await inFlight
-          } catch {}
-        }
-        await this.handleInterrupt(sessionID, "Session reset for handoff")
-        const settling = s.settlingPrompt
-        if (settling) {
-          let settleTimer: ReturnType<typeof setTimeout> | undefined
-          const hung = await Promise.race([
-            settling.then(
-              () => false,
-              () => false,
-            ),
-            new Promise<true>((resolve) => {
-              settleTimer = setTimeout(() => resolve(true), SETTLING_PROMPT_TIMEOUT_MS)
-            }),
-          ])
-          if (settleTimer) clearTimeout(settleTimer)
-          if (hung) {
-            const wedged = s.proc
-            if (wedged && !wedged.isClosed) {
-              this.intentionallyDisposed.add(wedged)
-              this.activeProcs.delete(wedged)
-              try {
-                await wedged.dispose()
-              } catch {}
-            } else if (wedged) {
-              this.activeProcs.delete(wedged)
-            }
-            s.proc = undefined
-            s.acpSessionId = undefined
-            if (s.settlingPrompt === settling) s.settlingPrompt = undefined
-          }
-        }
-        if (s.proc && !s.proc.isClosed && s.acpSessionId) {
-          try {
-            await s.proc.closeSession(s.acpSessionId)
-          } catch {}
-        }
-        s.acpSessionId = undefined
-        s.acpToolsSignature = undefined
-        s.lastModelId = undefined
-        s.lastModeApplied = undefined
-        s.lastError = null
-        s.pendingFreshHandoff = undefined
-        s.settlingPrompt = undefined
-        s.lastContextUsed = undefined
-        this.untrackWarmedIdle(sessionID)
-        await this.runStorageRemove(sessionID)
-      } finally {
-        if (s.resetLock === resetGate) s.resetLock = undefined
-        releaseReset!()
-      }
-    }
-    this.notifyChanged(sessionID)
-    return this.getState(sessionID)
-  }
-
   async handleInterrupt(sessionID: string, reason = "Cancelled"): Promise<void> {
     const s = this.sessions.get(sessionID)
     if (!s?.activeTurn) return
@@ -1106,7 +951,7 @@ export class SessionBridgeManager {
     // detaches it itself after enqueueing the error + close. Detaching first
     // would orphan the stream: the error would sit in bufferedParts and any
     // reader would hang forever on a never-closing stream.
-    for (const call of turn.pendingMcpCalls.values()) {
+    for (const call of turn.pendingQuestions.values()) {
       if (!call.resolved) {
         call.resolved = true
         try {
@@ -1124,7 +969,7 @@ export class SessionBridgeManager {
         call.abortCleanup = undefined
       }
     }
-    turn.pendingMcpCalls.clear()
+    turn.pendingQuestions.clear()
     turn.dispatchedCallIds.clear()
 
     if (s.proc && !s.proc.isClosed && s.acpSessionId) {
@@ -1148,7 +993,7 @@ export class SessionBridgeManager {
       clearTimeout(turn.flushTimer)
       turn.flushTimer = undefined
     }
-    for (const call of turn.pendingMcpCalls.values()) {
+    for (const call of turn.pendingQuestions.values()) {
       if (!call.resolved) {
         call.resolved = true
         try {
@@ -1166,7 +1011,7 @@ export class SessionBridgeManager {
         call.abortCleanup = undefined
       }
     }
-    turn.pendingMcpCalls.clear()
+    turn.pendingQuestions.clear()
     turn.dispatchedCallIds.clear()
 
     this.closeOpenBlocks(turn)
@@ -1229,7 +1074,7 @@ export class SessionBridgeManager {
         this.finishTurnCleanStop(
           s,
           s.activeTurn,
-          "Plugin reloaded (e.g. file saved during development) — agy sessions were torn down. Send a new message to continue; history restores via text handoff.",
+          "Plugin reloaded (e.g. file saved during development) — agy sessions were torn down. Send a new message to continue; Antigravity resumes its own session.",
           "plugin_unloaded",
           true,
         )
@@ -1271,9 +1116,6 @@ export class SessionBridgeManager {
     this.activeProcs.clear()
     this.sessions.clear()
     this.warmedIdleSessions.length = 0
-    try {
-      await this.mcpRelay.stop()
-    } catch {}
   }
 
   private notifyChanged(sessionID: string): void {
@@ -1303,12 +1145,32 @@ export class SessionBridgeManager {
     try {
       await Effect.runPromise(this.ctx.storage.remove(`${STORAGE_KEY_PREFIX}${sessionID}`))
     } catch {}
+    try {
+      await Effect.runPromise(this.ctx.storage.remove(`${DELIVERED_TURNS_KEY_PREFIX}${sessionID}`))
+    } catch {}
+  }
+
+  private async loadDeliveredTurns(sessionID: string): Promise<DeliveredTurns | undefined> {
+    try {
+      const raw = await Effect.runPromise(this.ctx.storage.get(`${DELIVERED_TURNS_KEY_PREFIX}${sessionID}`))
+      return isDeliveredTurns(raw) ? raw : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private async saveDeliveredTurns(sessionID: string, record: DeliveredTurns): Promise<void> {
+    try {
+      await Effect.runPromise(
+        this.ctx.storage.set(`${DELIVERED_TURNS_KEY_PREFIX}${sessionID}`, record as any),
+      )
+    } catch {}
   }
 
   private async ensureAcpSession(
     s: BridgeSession,
-    opts?: { readonly retryOnStale?: boolean; readonly markFreshHandoff?: boolean },
-  ): Promise<{ proc: AcpProcess; acpSessionId: string; freshSession: boolean }> {
+    opts?: { readonly retryOnStale?: boolean; readonly markResumeLost?: boolean },
+  ): Promise<{ proc: AcpProcess; acpSessionId: string; resumeLost: boolean }> {
     if (this.disposed) throw new PluginDisposedError()
     // Join in-flight work instead of fanning out: every waiter that survives a
     // superseded lock re-reads state, so only one spawner ever exists and no
@@ -1335,80 +1197,21 @@ export class SessionBridgeManager {
         continue
       }
       if (s.proc && !s.proc.isClosed && s.acpSessionId) {
-        // `agy acp` caches `tools/list` per acpSessionId: if the live snapshot
-        // now serves a different tool set than the session was created with
-        // (warmed empty list, or mid-session tool/agent change), refresh the
-        // ACP session on the SAME proc (no extra spawn) with the correct tools.
-        // freshSession=true arms the plain-text handoff so history is preserved.
-        if (s.acpToolsSignature !== undefined && s.acpToolsSignature !== acpToolsSignatureFor(s)) {
-          const proc = s.proc
-          const staleId = s.acpSessionId
-          try {
-            if (s.codeModeEnabled) {
-              await this.mcpRelay.start()
-            }
-          } catch {}
-          let relayUrl = ""
-          try {
-            relayUrl = s.codeModeEnabled ? this.mcpRelay.urlForSession(s.sessionID) : ""
-          } catch {}
-          const mcpServers = s.codeModeEnabled
-            ? [
-                {
-                  type: "http" as const,
-                  name: "oc",
-                  url: relayUrl,
-                  headers: this.mcpRelay.authHeaders(),
-                },
-              ]
-            : []
-          try {
-            if (!proc.isClosed && staleId) {
-              await proc.closeSession(staleId).catch(() => {})
-            }
-            const res = await proc.newSession({ cwd: s.cwd, mcpServers })
-            if (!res?.sessionId) throw new Error("empty sessionId from refreshed ACP session")
-            s.acpSessionId = String(res.sessionId)
-            s.acpToolsSignature = acpToolsSignatureFor(s)
-            s.lastModelId = undefined
-            s.lastModeApplied = undefined
-            s.lastError = null
-            if (s.mode !== "default") {
-              await proc.setMode(s.acpSessionId, s.mode).catch(() => {})
-              s.lastModeApplied = s.mode
-            }
-            await this.runStorageSet(s.sessionID, s.acpSessionId)
-            this.notifyChanged(s.sessionID)
-            return { proc, acpSessionId: s.acpSessionId, freshSession: true }
-          } catch {
-            // Refresh failed: drop the stale id so the full start path below
-            // spawns cleanly instead of reusing a broken session.
-            s.acpSessionId = undefined
-            s.acpToolsSignature = undefined
-            s.lastModelId = undefined
-            s.lastModeApplied = undefined
-          }
-        } else {
-          return { proc: s.proc, acpSessionId: s.acpSessionId, freshSession: false }
-        }
+        return { proc: s.proc, acpSessionId: s.acpSessionId, resumeLost: false }
       }
       break
     }
     if (this.disposed) throw new PluginDisposedError()
 
-    // Capture the mode/generation up front: a concurrent setCodeMode() /
-    // resetSession() invalidates this start before it installs s.proc.
-    const startCodeMode = s.codeModeEnabled
+    // Capture the generation up front: a concurrent resetSession() invalidates
+    // this start before it installs s.proc. Re-checked after every await below
+    // so an invalidation landing mid-start aborts before any further side
+    // effects (spawn, storage read, resume, session/new), not just before install.
     const startGeneration = s.startGeneration
-    // Re-checked after every await below: an invalidation landing mid-start
-    // must abort before any further side effects (spawn, storage read, resume,
-    // session/new), not just before install.
     const throwIfStale = () => {
-      if (s.startGeneration !== startGeneration || s.codeModeEnabled !== startCodeMode) {
-        throw new StaleAcpStartError()
-      }
+      if (s.startGeneration !== startGeneration) throw new StaleAcpStartError()
     }
-    let freshSession = false
+    let resumeFailed = false
     // Boxed so the adoption below survives analysis: assignments made inside
     // the start closure are invisible to outer control-flow narrowing, which
     // would otherwise shrink a plain `let` to its `undefined` initializer.
@@ -1425,21 +1228,13 @@ export class SessionBridgeManager {
       } catch {}
 
       if (this.disposed) throw new PluginDisposedError()
-      const codeModeEnabled = s.codeModeEnabled
-      let relayUrl = ""
-      if (codeModeEnabled) {
-        await this.mcpRelay.start()
-        if (this.disposed) throw new PluginDisposedError()
-        relayUrl = this.mcpRelay.urlForSession(s.sessionID)
-      }
-      if (this.disposed) throw new PluginDisposedError()
       throwIfStale()
 
       let disposedByBridge = false
-      // Reuse the session's live proc when it survived a soft handoff reset
-      // (no respawn/re-auth: MCP servers attach per session/new). Otherwise
-      // claim a pre-warmed spare when it matches this session's cwd (already
-      // initialize()d + authenticate()d, mode-agnostic). Otherwise spawn fresh.
+      // Reuse the session's live proc when its ACP session was dropped but the
+      // proc survived (no respawn/re-auth). Otherwise claim a pre-warmed spare
+      // when it matches this session's cwd (already initialize()d +
+      // authenticate()d). Otherwise spawn fresh.
       let proc: AcpProcess
       let claimedSpare = false
       let reusedLiveProc = false
@@ -1470,9 +1265,8 @@ export class SessionBridgeManager {
         if (!claimedSpare && !reusedLiveProc) {
           await proc.initialize()
           if (this.disposed) throw new PluginDisposedError()
-          // Explicit ACP auth: gemini-api-key when GEMINI_API_KEY is set,
-          // else ANTIGRAVITY_ACP_AUTH_METHOD override, else oauth-personal.
-          // Benign already-authenticated errors are ignored so cached/env auth works.
+          // Explicit ACP auth with exactly the selected method, never another.
+          // Benign already-authenticated errors are ignored so a cached sign-in works.
           try {
             await proc.authenticate()
           } catch (err) {
@@ -1484,18 +1278,6 @@ export class SessionBridgeManager {
         // Unbounded waits above (initialize/authenticate, possibly gated for a
         // long time): re-check before touching storage or the ACP session.
         throwIfStale()
-        // Code Mode by default: attaches only the single 'oc' Code Mode MCP server.
-        // Pure ACP opt-out uses zero bridged MCPs, 100% native agy acp.
-        const mcpServers = codeModeEnabled
-          ? [
-              {
-                type: "http" as const,
-                name: "oc",
-                url: relayUrl,
-                headers: this.mcpRelay.authHeaders(),
-              },
-            ]
-          : []
 
         const storedId = s.acpSessionId ?? (await this.runStorageGet(s.sessionID))
         if (s.startGeneration !== startGeneration) throw new StaleAcpStartError()
@@ -1503,24 +1285,17 @@ export class SessionBridgeManager {
         let res: any
         if (storedId) {
           try {
-            res = await proc.resumeSession({
-              sessionId: storedId,
-              cwd: s.cwd,
-              mcpServers,
-            })
+            res = await proc.resumeSession({ sessionId: storedId, cwd: s.cwd })
           } catch {
             res = undefined
           }
           if (s.startGeneration !== startGeneration) throw new StaleAcpStartError()
+          if (!res?.sessionId) resumeFailed = true
         }
 
         if (this.disposed) throw new PluginDisposedError()
         if (!res?.sessionId) {
-          freshSession = true
-          res = await proc.newSession({
-            cwd: s.cwd,
-            mcpServers,
-          })
+          res = await proc.newSession({ cwd: s.cwd })
         }
 
         if (this.disposed) throw new PluginDisposedError()
@@ -1539,18 +1314,15 @@ export class SessionBridgeManager {
         }
         s.proc = proc
         s.acpSessionId = String(res.sessionId)
-        s.acpToolsSignature = acpToolsSignatureFor(s)
         s.lastError = null
-        // A warm-driven fresh *replacement* (a stored id existed but resume
-        // failed) owns no server-side history: arm the text-handoff restore
-        // consumed by the first real turn. Persisting is deferred until that
-        // first turn consumes `pendingFreshHandoff` (see doStream): a bridge
-        // restart before turn 1 then still resumes the prior id, fails resume,
-        // and re-arms the handoff instead of silently adopting an empty fresh
-        // session with the flag lost. Brand-new warms (no prior stored id)
-        // persist immediately so LRU eviction keeps a resumable id.
-        if (freshSession && opts?.markFreshHandoff && storedId) {
-          s.pendingFreshHandoff = true
+        // A warm-driven *replacement* (a stored id existed but resume failed)
+        // owns no history: the first real turn tells the user. Persisting is
+        // deferred until that turn consumes `pendingResumeLost` (see doStream),
+        // so a bridge restart before turn 1 retries the prior id instead of
+        // silently adopting the empty session with the notice lost. Brand-new
+        // warms persist immediately so LRU eviction keeps a resumable id.
+        if (resumeFailed && opts?.markResumeLost) {
+          s.pendingResumeLost = true
         } else {
           await this.runStorageSet(s.sessionID, s.acpSessionId)
         }
@@ -1581,7 +1353,6 @@ export class SessionBridgeManager {
         if (s.proc === proc) {
           s.proc = undefined
           s.acpSessionId = undefined
-          s.acpToolsSignature = undefined
         }
         await proc.dispose()
         throw err
@@ -1594,9 +1365,9 @@ export class SessionBridgeManager {
     try {
       await s.startLock
     } catch (err) {
-      // Our own start was superseded mid-flight (mode flip / reset): the stale
+      // Our own start was superseded mid-flight (reset): the stale
       // proc was already disposed without being installed. Foreground turns
-      // retry once with the current mode (each retry needs a fresh
+      // retry once (each retry needs a fresh
       // invalidation, so no loop); background warms stay quiet so a reset
       // really tears down instead of eagerly reinstalling behind it.
       if (err instanceof StaleAcpStartError && !this.disposed) {
@@ -1611,13 +1382,13 @@ export class SessionBridgeManager {
     if (winner) {
       if (this.disposed) throw new PluginDisposedError()
       this.notifyChanged(s.sessionID)
-      return { proc: winner.proc, acpSessionId: winner.acpSessionId, freshSession: false }
+      return { proc: winner.proc, acpSessionId: winner.acpSessionId, resumeLost: false }
     }
     if (this.disposed || !s.proc || !s.acpSessionId) {
       throw new PluginDisposedError()
     }
     this.notifyChanged(s.sessionID)
-    return { proc: s.proc, acpSessionId: s.acpSessionId, freshSession }
+    return { proc: s.proc, acpSessionId: s.acpSessionId, resumeLost: resumeFailed }
   }
 
   private handleProcExit(
@@ -1640,11 +1411,10 @@ export class SessionBridgeManager {
     }
     s.lastError = `agy acp exited (code=${code}, signal=${signal})${tail ? `: ${tail.split("\n").at(-1)}` : ""}`
     s.acpSessionId = undefined
-    s.acpToolsSignature = undefined
     s.lastModelId = undefined
     s.lastModeApplied = undefined
     s.settlingPrompt = undefined
-    s.pendingFreshHandoff = undefined
+    s.pendingResumeLost = undefined
     if (s.activeTurn) {
       const turn = s.activeTurn
       if (turn.flushTimer) {
@@ -1655,7 +1425,7 @@ export class SessionBridgeManager {
         turn,
         new Error(s.lastError),
       )
-      for (const c of turn.pendingMcpCalls.values()) {
+      for (const c of turn.pendingQuestions.values()) {
         if (!c.resolved) {
           c.resolved = true
           try {
@@ -1670,7 +1440,7 @@ export class SessionBridgeManager {
           c.abortCleanup = undefined
         }
       }
-      turn.pendingMcpCalls.clear()
+      turn.pendingQuestions.clear()
       turn.dispatchedCallIds.clear()
       turn.bufferedParts.length = 0
       s.activeTurn = undefined
@@ -1685,12 +1455,10 @@ export class SessionBridgeManager {
   ): Promise<AcpPermissionOutcome> {
     const opts = params.options ?? []
     const allowOpt =
-      opts.find(
-        (o) =>
-          o.kind === "allow_once" ||
-          o.kind === "allow_always" ||
-          o.optionId.includes("allow"),
-      ) ?? opts[0]
+      opts.find((o) => o.kind === "allow_once") ??
+      opts.find((o) => o.kind === "allow_always" || o.optionId.includes("allow")) ??
+      opts[0]
+    const alwaysOpt = opts.find((o) => o.kind === "allow_always")
     const denyOpt = opts.find(
       (o) => o.kind === "reject_once" || o.kind === "reject_always" || o.optionId.includes("deny"),
     )
@@ -1702,12 +1470,6 @@ export class SessionBridgeManager {
     }
 
     const toolName = String(params.toolCall?.name ?? params.toolCall?.kind ?? "unknown")
-    // Always allow the internal MCP relay inside ACP: OpenCode itself enforces real permissions when running the tool!
-    if (toolName.startsWith("mcp_oc_")) {
-      return allowOpt
-        ? { outcome: "selected", optionId: allowOpt.optionId }
-        : { outcome: "cancelled" }
-    }
 
     if (s.mode === "auto") {
       return allowOpt
@@ -1724,6 +1486,9 @@ export class SessionBridgeManager {
     }
     if (resources.length === 0) resources.push(title)
 
+    // OpenCode offers "Allow always" only with save patterns, so it appears
+    // only when agy offers allow_always, carrying agy's security warning.
+    const warning = alwaysOpt ? antigravitySecurityWarning(alwaysOpt) : undefined
     try {
       await Effect.runPromise(
         this.ctx.permission.assert({
@@ -1731,10 +1496,12 @@ export class SessionBridgeManager {
           agent: (s.contextSnapshot?.agent ?? "build") as any,
           action: `antigravity.${params.toolCall?.kind ?? toolName}`,
           resources,
+          ...(alwaysOpt ? { save: resources } : {}),
           metadata: {
             tool: toolName,
             title,
             rawInput: params.toolCall?.rawInput,
+            ...(warning ? { [ANTIGRAVITY_WARNING_METADATA_KEY]: warning } : {}),
           },
         }),
       )
@@ -1814,7 +1581,7 @@ export class SessionBridgeManager {
 
   /**
    * Asks through OpenCode's native `question` tool by emitting a tool call in
-   * the active turn, like a relayed MCP call. Resolves with one answer list per
+   * the active turn. Resolves with one answer list per
    * question, or `undefined` when the question is unavailable or dismissed.
    */
   private async askOpenCodeQuestions(
@@ -1823,7 +1590,7 @@ export class SessionBridgeManager {
     toolCallIdHint?: string,
   ): Promise<Array<string[] | undefined> | undefined> {
     const turn = s.activeTurn
-    if (!turn || !s.contextSnapshot?.tools[OPENCODE_QUESTION_TOOL]) {
+    if (!turn || !s.contextSnapshot?.hasQuestionTool) {
       this.diag(s, "question bridge: OpenCode question tool unavailable")
       return undefined
     }
@@ -1835,10 +1602,9 @@ export class SessionBridgeManager {
     }
 
     const toolCallId = `oc_question_${++turn.partSeq}_${Math.random().toString(36).slice(2, 8)}`
-    const result = await new Promise<McpCallToolResult>((resolve) => {
-      turn.pendingMcpCalls.set(toolCallId, {
+    const result = await new Promise<ToolResultForAgy>((resolve) => {
+      turn.pendingQuestions.set(toolCallId, {
         toolCallId,
-        mcpName: OPENCODE_QUESTION_TOOL,
         openCodeToolName: OPENCODE_QUESTION_TOOL,
         args: { questions },
         emittedToOpenCode: false,
@@ -1847,7 +1613,7 @@ export class SessionBridgeManager {
         nativeToolCallId,
         bypassNativeTools: nativeToolCallId === undefined,
       })
-      this.scheduleFlushToolCalls(s, turn)
+      this.scheduleFlushToolCalls(turn)
     })
     if (result.isError) return undefined
     const parsed = parseQuestionToolAnswers(result.content.map((c) => c.text).join("\n"), questions)
@@ -1876,65 +1642,17 @@ export class SessionBridgeManager {
     return open.find((id) => /ask_question/i.test(turn.nativeToolText?.get(id) ?? ""))
   }
 
-  private async handleIncomingMcpCall(
-    sessionID: string,
-    mcpToolName: string,
-    args: unknown,
-    signal: AbortSignal,
-  ): Promise<McpCallToolResult> {
-    const s = this.sessions.get(sessionID)
-    const turn = s?.activeTurn
-    if (!s || !turn) {
-      return {
-        content: [{ type: "text", text: "No active Antigravity turn to execute OpenCode tool." }],
-        isError: true,
-      }
-    }
-
-    const openCodeToolName = s.contextSnapshot?.mcpSafeToOriginal.get(mcpToolName) ?? mcpToolName
-    const toolCallId = `oc_relay_${++turn.partSeq}_${Math.random().toString(36).slice(2, 8)}`
-
-    return new Promise<McpCallToolResult>((resolve) => {
-      const entry: PendingMcpCall = {
-        toolCallId,
-        mcpName: mcpToolName,
-        openCodeToolName,
-        args,
-        emittedToOpenCode: false,
-        resolved: false,
-        resolve,
-      }
-      turn.pendingMcpCalls.set(toolCallId, entry)
-
-      const onAbort = () => {
-        if (!entry.resolved) {
-          entry.resolved = true
-          entry.abortCleanup = undefined
-          turn.pendingMcpCalls.delete(toolCallId)
-          resolve({
-            content: [{ type: "text", text: "MCP tool call aborted by ACP host." }],
-            isError: true,
-          })
-        }
-      }
-      signal.addEventListener("abort", onAbort, { once: true })
-      entry.abortCleanup = () => signal.removeEventListener("abort", onAbort)
-
-      this.scheduleFlushToolCalls(s, turn)
-    })
-  }
-
-  private scheduleFlushToolCalls(s: BridgeSession, turn: ActiveTurn): void {
+  private scheduleFlushToolCalls(turn: ActiveTurn): void {
     if (turn.flushTimer) clearTimeout(turn.flushTimer)
     turn.flushTimer = setTimeout(() => {
       turn.flushTimer = undefined
-      this.tryFlushToolCalls(s, turn)
+      this.tryFlushToolCalls(turn)
     }, 60)
   }
 
-  private tryFlushToolCalls(s: BridgeSession, turn: ActiveTurn): void {
+  private tryFlushToolCalls(turn: ActiveTurn): void {
     if (!turn.controller) return
-    const unsent = [...turn.pendingMcpCalls.values()].filter((c) => !c.emittedToOpenCode)
+    const unsent = [...turn.pendingQuestions.values()].filter((c) => !c.emittedToOpenCode)
     if (unsent.length === 0) return
 
     // agy's own ask_question call stays open until it is answered, so close
@@ -2052,6 +1770,15 @@ export class SessionBridgeManager {
       } catch {}
     }
     turn.bufferedParts.push(part)
+  }
+
+  /** A plugin notice shown in the turn; marked local so it is never sent to agy. */
+  private emitLocalNotice(turn: ActiveTurn, text: string): void {
+    const id = `t_${++turn.partSeq}`
+    const meta = { providerMetadata: { [ACP_PROVIDER_ID]: { localStatus: true } } }
+    this.emitPart(turn, { type: "text-start", id, ...meta })
+    this.emitPart(turn, { type: "text-delta", id, delta: text })
+    this.emitPart(turn, { type: "text-end", id, ...meta })
   }
 
   private closeOpenBlocks(turn: ActiveTurn): void {
@@ -2240,11 +1967,6 @@ export class SessionBridgeManager {
       let displayName = turn.activeNativeTools.get(callId)
       if (displayName === undefined) {
         const name = String(update.name ?? update.kind ?? "tool")
-        // Relayed MCP calls already have their own OpenCode tool parts.
-        if (name.startsWith("mcp_oc_")) {
-          turn.relayedUpdateIds.add(callId)
-          return
-        }
         if (kind !== "tool_call") return
 
         this.closeOpenBlocks(turn)
@@ -2295,9 +2017,9 @@ export class SessionBridgeManager {
           providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
         })
 
-        // If any relayed OpenCode tool calls were waiting for this native tool to settle, flush them now!
-        if (turn.pendingMcpCalls.size > 0) {
-          this.tryFlushToolCalls(s, turn)
+        // If any OpenCode questions were waiting for this native tool to settle, flush them now!
+        if (turn.pendingQuestions.size > 0) {
+          this.tryFlushToolCalls(turn)
         }
       }
     }
@@ -2341,7 +2063,7 @@ export class SessionBridgeManager {
       clearTimeout(turn.flushTimer)
       turn.flushTimer = undefined
     }
-    for (const call of turn.pendingMcpCalls.values()) {
+    for (const call of turn.pendingQuestions.values()) {
       if (!call.resolved) {
         call.resolved = true
         try {
@@ -2359,7 +2081,7 @@ export class SessionBridgeManager {
         call.abortCleanup = undefined
       }
     }
-    turn.pendingMcpCalls.clear()
+    turn.pendingQuestions.clear()
     turn.dispatchedCallIds.clear()
 
     this.closeOpenBlocks(turn)
@@ -2392,8 +2114,7 @@ export class SessionBridgeManager {
   ): ReadableStream<LanguageModelV3StreamPart> {
     // Local harness statuses (cooldown blocks, restarts, missing CLI), not
     // turns that ran through `agy acp`. Tagged with a localStatus marker so
-    // hasUnseenNonAcpAssistantHistory skips them: they are neither a completed
-    // ACP handoff checkpoint nor a foreign model turn.
+    // hasNonAcpAssistantHistory skips them: they are not another model's turn.
     const id = "t_1"
     const localMeta = { providerMetadata: { [ACP_PROVIDER_ID]: { localStatus: true } } } as const
     return new ReadableStream<LanguageModelV3StreamPart>({
@@ -2470,6 +2191,20 @@ export class SessionBridgeManager {
         const hdrs = options.headers ?? {}
         const sessionID = String(hdrs["x-opencode-session-id"] ?? "__default__")
         const variant = String(hdrs["x-opencode-variant"] ?? "") || undefined
+        // Only the user's own turns reach agy. OpenCode's auxiliary requests
+        // (compaction, generate) would send OpenCode-written prompts as turns.
+        const requestKind = String(hdrs["x-opencode-request-kind"] ?? "primary")
+        if (requestKind === "title") {
+          return { stream: bridge.createImmediateTextStream("Antigravity session", "local_title") }
+        }
+        if (requestKind !== "primary") {
+          return {
+            stream: bridge.createImmediateTextStream(
+              `Antigravity doesn't run OpenCode ${requestKind} requests. It manages its own context; send /compact to have Antigravity compact its conversation.`,
+              "unsupported_request",
+            ),
+          }
+        }
         const s = bridge.getOrCreateSession(sessionID)
 
         // Check if this is an OpenCode tool-result continuation step for an active ACP turn
@@ -2485,12 +2220,12 @@ export class SessionBridgeManager {
                 controller.enqueue(existingTurn.bufferedParts.shift()!)
               }
 
-              // Feed OpenCode's tool results back into the waiting HTTP MCP calls
+              // Feed OpenCode's question answers back to the waiting agy questions
               for (const callId of [...existingTurn.dispatchedCallIds]) {
                 existingTurn.dispatchedCallIds.delete(callId)
-                const pending = existingTurn.pendingMcpCalls.get(callId)
+                const pending = existingTurn.pendingQuestions.get(callId)
                 if (!pending) continue
-                existingTurn.pendingMcpCalls.delete(callId)
+                existingTurn.pendingQuestions.delete(callId)
                 if (!pending.resolved) {
                   pending.resolved = true
                   try {
@@ -2520,8 +2255,8 @@ export class SessionBridgeManager {
                 } else {
                   bridge.finalizeTurnStop(s, existingTurn)
                 }
-              } else if (!existingTurn.flushTimer && existingTurn.pendingMcpCalls.size > 0) {
-                bridge.scheduleFlushToolCalls(s, existingTurn)
+              } else if (!existingTurn.flushTimer && existingTurn.pendingQuestions.size > 0) {
+                bridge.scheduleFlushToolCalls(existingTurn)
               }
             })
             return { stream }
@@ -2531,6 +2266,23 @@ export class SessionBridgeManager {
           await bridge.handleInterrupt(sessionID, "Superseded by new prompt")
         } else if (existingTurn) {
           await bridge.handleInterrupt(sessionID, "Superseded by new prompt")
+        }
+
+        // T3 Code keeps a thread on one provider. A session that already has
+        // replies from another model stays there: Antigravity is never handed
+        // that model's conversation.
+        if (hasNonAcpAssistantHistory(options.prompt)) {
+          return {
+            stream: bridge.createImmediateTextStream(FOREIGN_HISTORY_MESSAGE, "foreign_history"),
+          }
+        }
+
+        let target: ReturnType<typeof resolveAcpModelTarget>
+        try {
+          target = resolveAcpModelTarget(bridge.catalog, modelID, variant)
+        } catch (err) {
+          if (!(err instanceof UnavailableModelError)) throw err
+          return { stream: bridge.createImmediateTextStream(err.message, "model_unavailable") }
         }
 
         if (isSyntheticRestartAfterError(options.prompt)) {
@@ -2641,17 +2393,23 @@ export class SessionBridgeManager {
           }
         }
 
-        // T3-Code-style create_with_handoff (v0.2.0): never hit a thread lock.
-        // Normal ACP-to-ACP flow (no unseen non-ACP turns) uses the raw thin
-        // prompt; switching back after normal-model turns starts a fresh agy
-        // session on the SAME live proc (no respawn/re-auth) and sends a
-        // plain-text-only handoff (no tool/reasoning replay).
-        const needsHandoff = hasUnseenNonAcpAssistantHistory(options.prompt)
-        if (needsHandoff) {
-          await bridge.softResetForHandoff(sessionID)
+        // Like T3 Code's rollback: when OpenCode's history no longer holds
+        // a message agy received (revert, undo, edit), continuing agy's
+        // session would answer from removed turns. Replace it with a fresh
+        // session that gets the kept conversation instead.
+        const turnHistory = readTurnHistory(options.prompt)
+        const delivered = await bridge.loadDeliveredTurns(sessionID)
+        let rewound = false
+        if (delivered && historyDiverged(delivered, turnHistory)) {
+          const currentAcpId = s.acpSessionId ?? (await bridge.runStorageGet(sessionID))
+          if (currentAcpId === delivered.acpSessionId) {
+            bridge.diag(s, "rewind: OpenCode history diverged from agy session; starting fresh")
+            await bridge.resetSession(sessionID)
+            rewound = true
+          }
         }
 
-        let ensured: { proc: AcpProcess; acpSessionId: string; freshSession: boolean }
+        let ensured: { proc: AcpProcess; acpSessionId: string; resumeLost: boolean }
         try {
           ensured = await bridge.ensureAcpSession(s)
         } catch (err) {
@@ -2673,28 +2431,40 @@ export class SessionBridgeManager {
           }
           throw err
         }
-        let { proc, acpSessionId, freshSession } = ensured
+        let { proc, acpSessionId, resumeLost } = ensured
         let ensuredGeneration = s.startGeneration
 
-        // Apply model + thinking level target
-        const target = resolveAcpModelTarget(bridge.catalog, modelID, variant)
+        // Apply model + thinking level target. agy rejecting both forms is
+        // reported, never replaced by whichever model the session had.
         const applyModelTarget = async (): Promise<void> => {
           if (s.lastModelId !== target.acpModelId) {
             try {
               await proc.setModel(acpSessionId, target.acpModelId)
-            } catch {
-              // Fallback to configOptions if combined ID isn't accepted on a model update
-              await proc.setConfigOption(acpSessionId, "model", target.baseModelId).catch(() => {})
-              if (target.thoughtLevel) {
-                await proc
-                  .setConfigOption(acpSessionId, "thought_level", target.thoughtLevel)
-                  .catch(() => {})
+            } catch (setModelErr) {
+              // Runtimes that list base models take the model and level as config options.
+              try {
+                await proc.setConfigOption(acpSessionId, "model", target.baseModelId)
+                if (target.thoughtLevel) {
+                  await proc.setConfigOption(acpSessionId, "thought_level", target.thoughtLevel)
+                }
+              } catch {
+                const reason = setModelErr instanceof Error ? setModelErr.message : String(setModelErr)
+                throw new UnavailableModelError(
+                  `Antigravity did not accept the model "${target.acpModelId}" (${reason.split("\n")[0]}). Pick another Antigravity model.`,
+                )
               }
             }
             s.lastModelId = target.acpModelId
           }
         }
-        await applyModelTarget()
+        try {
+          await applyModelTarget()
+        } catch (err) {
+          if (!(err instanceof UnavailableModelError)) throw err
+          s.lastError = err.message
+          bridge.notifyChanged(sessionID)
+          return { stream: bridge.createImmediateTextStream(err.message, "model_unavailable") }
+        }
 
         // A resetSession landing during setModel disposes `proc` and clears the
         // session: revalidate BEFORE installing s.activeTurn or calling
@@ -2711,7 +2481,7 @@ export class SessionBridgeManager {
           const retry = await bridge.ensureAcpSession(s)
           proc = retry.proc
           acpSessionId = retry.acpSessionId
-          freshSession = freshSession || retry.freshSession
+          resumeLost = resumeLost || retry.resumeLost
           ensuredGeneration = s.startGeneration
           await applyModelTarget()
           if (isStaleInstall()) {
@@ -2719,35 +2489,33 @@ export class SessionBridgeManager {
           }
         }
 
-        // T3-Code-style create_with_handoff: plain-text-only history when
-        // switching back after normal-model turns, else raw thin prompt.
-        // Zero outer system prompt, zero tool schemas, zero tool/reasoning replay.
-        // Fallback: if session/resume failed on an existing ACP thread, the fresh
-        // session/new owns no history — hand off prior turns as plain text so the
-        // earlier conversation isn't silently lost. Brand-new conversations (a
-        // single user turn, nothing prior) stay on the raw thin prompt.
-        // pendingFreshHandoff covers the warm path: the fresh install happened
-        // in an earlier call, so this turn consumes the flag to restore history.
-        const nonSystemTurnCount = options.prompt.filter((m) => m.role !== "system").length
-        const hadPendingFresh = s.pendingFreshHandoff === true
-        const hadFreshStart = freshSession || hadPendingFresh
-        s.pendingFreshHandoff = undefined
-        if (hadPendingFresh && !freshSession) {
-          // Warm-installed fresh session deferred its storage write: persist
-          // now that the first real turn consumed the handoff flag.
+        // Like T3 Code, only the user's latest message and its attachments go
+        // to agy: agy owns its session history, nothing earlier is replayed.
+        // When resume failed, the new agy session has no history; the user is
+        // told once instead of the conversation being sent again.
+        // pendingResumeLost covers the warm path, where the replacement
+        // session was installed in an earlier call.
+        const hadPendingResumeLost = s.pendingResumeLost === true
+        s.pendingResumeLost = undefined
+        if (hadPendingResumeLost) {
+          // The warm deferred its storage write until this turn consumed the flag.
           await bridge.runStorageSet(sessionID, acpSessionId)
         }
-        const promptBlocks =
-          needsHandoff || (hadFreshStart && nonSystemTurnCount > 1)
-            ? buildTextOnlyHandoffPromptBlocks(options.prompt, { maxChars: 16_000 })
-            : buildThinAcpPromptBlocks(options.prompt)
+        const hasPriorTurns = options.prompt.some((m) => m.role === "assistant")
+        const showResumeLost = (resumeLost || hadPendingResumeLost) && hasPriorTurns
+        const promptBlocks = buildThinAcpPromptBlocks(options.prompt, {
+          storeAttachment: (file) => bridge.storeAttachment(sessionID, file),
+        })
+        const keptConversation = rewound ? buildKeptConversation(options.prompt) : undefined
+        if (keptConversation) promptBlocks.unshift({ type: "text", text: keptConversation })
+        const deliveredRecord = recordDelivery(turnHistory, acpSessionId)
 
         const turn: ActiveTurn = {
           bufferedParts: [],
           partSeq: 0,
            activeNativeTools: new Map(),
           relayedUpdateIds: new Set(),
-          pendingMcpCalls: new Map(),
+          pendingQuestions: new Map(),
           dispatchedCallIds: new Set(),
           promptSettled: false,
         }
@@ -2756,7 +2524,10 @@ export class SessionBridgeManager {
         bridge.notifyChanged(sessionID)
 
         const stream = bridge.createBoundStream(s, turn, options.abortSignal, () => {
+          if (rewound) bridge.emitLocalNotice(turn, REWIND_NOTICE)
+          else if (showResumeLost) bridge.emitLocalNotice(turn, RESUME_LOST_NOTICE)
           const pending = proc.prompt(acpSessionId, promptBlocks)
+          if (deliveredRecord) void bridge.saveDeliveredTurns(sessionID, deliveredRecord)
           // Track the in-flight prompt so a follow-up turn waits for a
           // cancelled prompt to settle server-side before sending a new one
           // on the same live proc. Never rejects; clears itself on settle.
@@ -2856,7 +2627,7 @@ export class SessionBridgeManager {
                 clearTimeout(turn.flushTimer)
                 turn.flushTimer = undefined
               }
-              for (const c of turn.pendingMcpCalls.values()) {
+              for (const c of turn.pendingQuestions.values()) {
                 if (!c.resolved) {
                   c.resolved = true
                   try {
@@ -2871,7 +2642,7 @@ export class SessionBridgeManager {
                   c.abortCleanup = undefined
                 }
               }
-              turn.pendingMcpCalls.clear()
+              turn.pendingQuestions.clear()
               turn.dispatchedCallIds.clear()
 
               s.lastError = error.message

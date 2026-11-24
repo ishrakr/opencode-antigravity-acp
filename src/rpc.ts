@@ -5,13 +5,13 @@ export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
 export interface AcpSessionState {
   readonly sessionID: string
   readonly mode: AcpMode
-  readonly codeModeEnabled: boolean
+  /** The selected sign-in method's label, such as "Google account". */
+  readonly authMethod: string
   readonly starting: boolean
   readonly acpSessionId: string | null
   readonly connected: boolean
   readonly busy: boolean
   readonly modelCount: number
-  readonly relayedToolCount: number
   readonly lastError: string | null
   readonly cooldownUntil: number | null
 }
@@ -30,26 +30,24 @@ const stateSchema = {
   properties: {
     sessionID: { type: "string" },
     mode: { type: "string", enum: ["auto", "accept-edits", "default", "plan"] },
-    codeModeEnabled: { type: "boolean" },
+    authMethod: { type: "string" },
     starting: { type: "boolean" },
     acpSessionId: { anyOf: [{ type: "string" }, { type: "null" }] },
     connected: { type: "boolean" },
     busy: { type: "boolean" },
     modelCount: { type: "number" },
-    relayedToolCount: { type: "number" },
     lastError: { anyOf: [{ type: "string" }, { type: "null" }] },
     cooldownUntil: { anyOf: [{ type: "number" }, { type: "null" }] },
   },
   required: [
     "sessionID",
     "mode",
-    "codeModeEnabled",
+    "authMethod",
     "starting",
     "acpSessionId",
     "connected",
     "busy",
     "modelCount",
-    "relayedToolCount",
     "lastError",
     "cooldownUntil",
   ],
@@ -71,18 +69,6 @@ export const AcpRpc = Rpc.define({
           mode: { type: "string", enum: ["auto", "accept-edits", "default", "plan"] },
         },
         required: ["sessionID", "mode"],
-        additionalProperties: false,
-      },
-      output: stateSchema,
-    },
-    setCodeMode: {
-      input: {
-        type: "object",
-        properties: {
-          sessionID: { type: "string" },
-          codeModeEnabled: { type: "boolean" },
-        },
-        required: ["sessionID", "codeModeEnabled"],
         additionalProperties: false,
       },
       output: stateSchema,

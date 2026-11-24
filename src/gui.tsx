@@ -247,54 +247,6 @@ const css = `
   cursor: default;
 }
 
-.agy-bridge-seg {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 3px;
-  padding: 3px;
-  border-radius: 7px;
-  background: var(--v2-background-bg-base, #161616);
-  border: 0.5px solid var(--v2-border-border-muted, rgba(255, 255, 255, 0.08));
-}
-
-.agy-bridge-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  min-block-size: 28px;
-  padding: 4px 8px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--v2-text-text-muted, #aeaeae);
-  font-family: inherit;
-  font-size: 12.5px;
-  font-weight: 500;
-  line-height: 16px;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background-color 100ms ease, color 100ms ease;
-}
-.agy-bridge-btn:hover:not(:disabled, [aria-pressed="true"]) {
-  background: var(--v2-overlay-simple-overlay-hover, rgba(255, 255, 255, 0.06));
-  color: var(--v2-text-text-base, #fafafa);
-}
-.agy-bridge-btn[aria-pressed="true"] {
-  background: var(--v2-background-bg-layer-02, #2e2e2e);
-  color: var(--v2-text-text-base, #fafafa);
-  box-shadow: var(--v2-elevation-elements, inset 0 0 0 0.5px rgba(255, 255, 255, 0.14));
-  font-weight: 540;
-}
-.agy-bridge-btn:focus-visible {
-  outline: 2px solid var(--v2-border-border-focus, #3b82f6);
-  outline-offset: 1px;
-}
-.agy-bridge-btn:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
 .agy-hint {
   margin: 0;
   font-size: 11.5px;
@@ -326,13 +278,6 @@ interface AcpRpcClient {
   getState(input: { readonly sessionID: string }, options?: RpcCallOptions): Promise<AcpSessionState>
   setMode(
     input: { readonly sessionID: string; readonly mode: AcpMode },
-    options?: RpcCallOptions,
-  ): Promise<AcpSessionState>
-  setCodeMode(
-    input: {
-      readonly sessionID: string
-      readonly codeModeEnabled: boolean
-    },
     options?: RpcCallOptions,
   ): Promise<AcpSessionState>
   resetSession(input: { readonly sessionID: string }, options?: RpcCallOptions): Promise<AcpSessionState>
@@ -519,7 +464,6 @@ export default Plugin.define({
     function AcpControlsPopover(input: ComposerPillMenuProps) {
       const uid = createUniqueId()
       const [modeSaving, setModeSaving] = createSignal<AcpMode | null>(null)
-      const [codeModeSaving, setCodeModeSaving] = createSignal(false)
       const [reloading, setReloading] = createSignal(false)
       const [actionError, setActionError] = createSignal<string | null>(null)
       const [now, setNow] = createSignal(Date.now())
@@ -549,7 +493,6 @@ export default Plugin.define({
       })
 
       const activeMode = (): AcpMode => state()?.mode ?? "auto"
-      const codeModeEnabled = () => state()?.codeModeEnabled ?? true
       const activeModeMeta = () => MODE_OPTIONS.find((m) => m.id === activeMode()) ?? MODE_OPTIONS[0]
 
       const cooldownSeconds = () => {
@@ -595,14 +538,7 @@ export default Plugin.define({
         return undefined
       }
 
-      const bridgeBadgeText = () => {
-        const st = state()
-        if (!st) return "Code Mode"
-        if (st.codeModeEnabled) {
-          return st.relayedToolCount > 0 ? `Code Mode (${st.relayedToolCount})` : "Code Mode"
-        }
-        return "Pure ACP"
-      }
+      const authBadgeText = () => state()?.authMethod ?? "Google account"
 
       const selectMode = async (mode: AcpMode) => {
         if (modeSaving() !== null || activeMode() === mode) return
@@ -618,33 +554,6 @@ export default Plugin.define({
           setActionError(fmtErr(err))
         } finally {
           setModeSaving(null)
-        }
-      }
-
-      const selectCodeMode = async (nextCodeMode: boolean) => {
-        if (codeModeSaving() || codeModeEnabled() === nextCodeMode) return
-        const sid = sessionID()
-        const dir = directory()
-        setActionError(null)
-        setCodeModeSaving(true)
-        const gen = nextGen(sid)
-        try {
-          const next = await getRpc().setCodeMode(
-            { sessionID: sid, codeModeEnabled: nextCodeMode },
-            buildOpts(dir),
-          )
-          updateSessionState(sid, next, gen)
-          ctx.toast.show({
-            title: "ACP mode updated",
-            description: nextCodeMode
-              ? "Code Mode MCP attached (single 'oc' server, switching reconnects with a plain-text handoff of conversation context)"
-              : "Pure ACP — 100% native agy acp, zero bridged MCPs (switching reconnects with a plain-text handoff of conversation context)",
-            variant: "success",
-          })
-        } catch (err) {
-          setActionError(fmtErr(err))
-        } finally {
-          setCodeModeSaving(false)
         }
       }
 
@@ -671,8 +580,6 @@ export default Plugin.define({
 
       const modeHeadingId = `${uid}-mode`
       const modeHintId = `${uid}-mode-hint`
-      const bridgeHeadingId = `${uid}-bridge`
-      const bridgeHintId = `${uid}-bridge-hint`
 
       return (
         <div class="agy-pop">
@@ -682,7 +589,7 @@ export default Plugin.define({
               <span class="agy-status-text">{statusText()}</span>
             </div>
             <div class="agy-meta-chips">
-              <span class="agy-chip">{bridgeBadgeText()}</span>
+              <span class="agy-chip" title="Sign-in method">{authBadgeText()}</span>
             </div>
           </div>
 
@@ -738,48 +645,6 @@ export default Plugin.define({
             </div>
             <p id={modeHintId} class="agy-hint">
               {activeModeMeta().detail}
-            </p>
-          </div>
-
-          <div class="agy-sec">
-            <div class="agy-sec-head">
-              <span id={bridgeHeadingId} class="agy-sec-title">
-                ACP mode
-              </span>
-              <span class="agy-sec-badge">{bridgeBadgeText()}</span>
-            </div>
-            <div role="group" aria-labelledby={bridgeHeadingId} class="agy-bridge-seg">
-              <button
-                type="button"
-                class="agy-bridge-btn"
-                aria-pressed={!codeModeEnabled()}
-                aria-describedby={bridgeHintId}
-                disabled={codeModeSaving()}
-                onClick={() => void selectCodeMode(false)}
-              >
-                <Show when={codeModeSaving() && codeModeEnabled()}>
-                  <ctx.ui.Loader size="small" />
-                </Show>
-                <span>Pure ACP</span>
-              </button>
-              <button
-                type="button"
-                class="agy-bridge-btn"
-                aria-pressed={codeModeEnabled()}
-                aria-describedby={bridgeHintId}
-                disabled={codeModeSaving()}
-                onClick={() => void selectCodeMode(true)}
-              >
-                <Show when={codeModeSaving() && !codeModeEnabled()}>
-                  <ctx.ui.Loader size="small" />
-                </Show>
-                <span>+ Code Mode</span>
-              </button>
-            </div>
-            <p id={bridgeHintId} class="agy-hint">
-              {codeModeEnabled()
-                ? "Code Mode default: attaches only the single 'oc' Code Mode MCP server (zero prompt injection; switching reconnects with a plain-text handoff of conversation context)."
-                : "Pure ACP opt-out: mcpServers [], zero bridged MCPs, 100% native agy acp (switching reconnects with a plain-text handoff of conversation context)."}
             </p>
           </div>
 
@@ -869,7 +734,7 @@ export default Plugin.define({
           if (!target) return
           // Capture the generation BEFORE the reset RPC: only this reset may
           // install its result, so a late reset response cannot overwrite a
-          // newer setCodeMode update that landed mid-flight.
+          // newer state update that landed mid-flight.
           const gen = nextGen(target.sessionID)
           const next = await getRpc().resetSession(
             { sessionID: target.sessionID },
