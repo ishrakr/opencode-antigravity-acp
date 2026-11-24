@@ -608,8 +608,6 @@ export class SessionBridgeManager {
             }
           }
         }
-        // Legacy single-key shape (pre-bucket) migrates into the global bucket.
-        applyRecord("global", await read(COOLDOWN_STORAGE_KEY))
         for (const bucket of COOLDOWN_BUCKETS) {
           applyRecord(bucket, await read(`${COOLDOWN_STORAGE_KEY}:${bucket}`))
         }

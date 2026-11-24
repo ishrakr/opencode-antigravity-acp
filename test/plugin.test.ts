@@ -298,8 +298,8 @@ describe("Antigravity tool display (shapes recorded from agy 1.5.14)", () => {
     expect(diff).toContain("@@ -15,6 +15,6 @@\n line 15\n line 16\n line 17\n-line 18\n+LINE 18\n")
   })
 
-  test("history sanitizer still flattens renamed and legacy Antigravity tools", () => {
-    for (const name of ["antigravity.shell", "acp_run_command"]) {
+  test("history sanitizer flattens Antigravity tools", () => {
+    for (const name of ["antigravity.shell"]) {
       const msgs: any[] = [
         { role: "assistant", content: [{ type: "tool-call", name, input: { command: "ls" }, providerExecuted: true }] },
       ]
@@ -308,6 +308,7 @@ describe("Antigravity tool display (shapes recorded from agy 1.5.14)", () => {
       expect(isAcpToolName(name)).toBe(true)
     }
     expect(isAcpToolName("shell")).toBe(false)
+    expect(isAcpToolName("acp_run_command")).toBe(false)
   })
 
   test("streams the readable tool call and result through doStream", async () => {
@@ -1716,8 +1717,8 @@ describe("Session start races, resume and settling prompts", () => {
     const [s1, s2] = await Promise.all([p1, p2])
     expect(s1.cooldownUntil).not.toBeNull()
     expect(s2.cooldownUntil).not.toBeNull()
-    // Exactly one read pass over the cooldown keys (legacy + 4 buckets).
-    expect(getCalls.filter((k) => k.startsWith("antigravity-acp:cooldown")).length).toBe(5)
+    // Exactly one read pass over the 4 cooldown buckets.
+    expect(getCalls.filter((k) => k.startsWith("antigravity-acp:cooldown")).length).toBe(4)
     await bridge.disposeAll()
   })
 

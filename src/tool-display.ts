@@ -10,12 +10,9 @@ import type { AcpSessionUpdate } from "./acp-client.js"
 
 export const ACP_TOOL_PREFIX = "antigravity."
 
-/** Names emitted by plugin versions up to 0.2.2. */
-const LEGACY_TOOL_PREFIX = "acp_"
-
 export function isAcpToolName(name: unknown): boolean {
   const n = String(name ?? "")
-  return n.startsWith(ACP_TOOL_PREFIX) || n.startsWith(LEGACY_TOOL_PREFIX)
+  return n.startsWith(ACP_TOOL_PREFIX)
 }
 
 type Shape = "read" | "edit" | "write" | "shell" | "grep" | "glob" | "list" | "websearch" | "webfetch"
