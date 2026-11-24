@@ -5,6 +5,7 @@ import { resolve } from "node:path"
 const targets = [
   // Sandboxed iframes cannot load ES modules: a classic IIFE.
   { entry: "src/status.ts", out: "status/main.js", node: false },
+  { entry: "src/command.ts", out: "command/main.js", node: false },
   // The service runs under Node; built-ins stay external.
   { entry: "src/main.ts", out: "service/main.js", node: true },
 ]

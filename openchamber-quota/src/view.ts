@@ -88,3 +88,27 @@ export function formatReset(resetAt: number, now: number, locale?: string): stri
   if (resetAt - now < 6 * 24 * 3_600_000) return date.toLocaleString(locale, { weekday: "short", ...time })
   return date.toLocaleDateString(locale, { month: "short", day: "numeric" })
 }
+
+/** Toasts hold up to 500 characters. */
+const SUMMARY_MAX = 500
+
+/**
+ * What `/agy-quota` shows: each group's windows with what is left and when it
+ * refills, Gemini first. With an Antigravity `modelId`, that group comes first.
+ */
+export function quotaSummary(data: QuotaProviderUsageData, now: number, modelId: string | null = null, locale?: string): string {
+  if (!data.ok || !data.usage) return (data.error ?? "agy reported no quota.").slice(0, SUMMARY_MAX)
+  const groups = toGroupViews(data, modelId ?? "gemini")
+  if (groups.length === 0) return "agy reported no quota groups."
+  const lines = groups.map((group) => {
+    const windows = group.windows.map((line) => {
+      const left = line.remaining === null ? "–" : `${line.remaining}% left`
+      const refill = line.resetAt !== null && line.resetAt > now ? `, refills ${formatReset(line.resetAt, now, locale)}` : ""
+      return `${line.label} ${left}${refill}`
+    })
+    const tag = modelId !== null && group.current ? " (this session)" : ""
+    return `${group.name}${tag}: ${windows.join(" · ")}`
+  })
+  const text = `Antigravity quota\n${lines.join("\n")}`
+  return text.length > SUMMARY_MAX ? `${text.slice(0, SUMMARY_MAX - 1)}…` : text
+}

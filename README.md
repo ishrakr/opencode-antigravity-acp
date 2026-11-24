@@ -140,7 +140,7 @@ When an **Antigravity (ACP)** model is active, an **`ACP`** pill appears above t
 
 ## Quota in OpenChamber
 
-[`openchamber-quota/`](./openchamber-quota) is an OpenChamber extension that shows your Antigravity 5-hour and weekly limits per model group on OpenChamber's Usage page and in the header. It reads them from `agy`'s own `/quota` command, using your existing `agy` login. Add the folder in **Settings → Extensions**.
+[`openchamber-quota/`](./openchamber-quota) is an OpenChamber extension that shows your Antigravity 5-hour and weekly limits per model group in an **Antigravity** section of Work Status, and in a notification when you type `/agy-quota` in the chat box. It reads them from `agy`'s own `/quota` command, using your existing `agy` login, and runs no model turn. Add the folder in **Settings → Extensions** and allow its local service.
 
 ---
 

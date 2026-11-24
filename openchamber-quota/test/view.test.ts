@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { antigravityModelOf, groupMatchesModel, shortGroupName, toGroupViews, toneFor } from "../src/view.ts"
+import { antigravityModelOf, groupMatchesModel, quotaSummary, shortGroupName, toGroupViews, toneFor } from "../src/view.ts"
 import { toUsageData } from "../src/quota.ts"
 
 const usage = toUsageData({
@@ -68,5 +68,36 @@ describe("group views", () => {
     expect(toneFor(10)).toBe("error")
     expect(toneFor(49)).toBe("warning")
     expect(toneFor(50)).toBe("success")
+  })
+})
+
+describe("/agy-quota summary", () => {
+  const now = Date.parse("2026-11-23T20:00:00Z")
+
+  test("lists every group with what is left and when it refills", () => {
+    const text = quotaSummary(usage, now, null, "en-US")
+    const lines = text.split("\n")
+    expect(lines[0]).toBe("Antigravity quota")
+    expect(lines[1]).toStartWith("Gemini: 5-hour 94% left, refills ")
+    expect(lines[1]).toContain("Weekly 97% left, refills ")
+    expect(lines[2]).toStartWith("Claude & GPT: 5-hour 100% left")
+    expect(lines[2]).toContain("Weekly 42% left")
+    expect(text).not.toContain("this session")
+    expect(text.length).toBeLessThanOrEqual(500)
+  })
+
+  test("puts the session's group first and marks it", () => {
+    const lines = quotaSummary(usage, now, "claude-opus-5-5", "en-US").split("\n")
+    expect(lines[1]).toStartWith("Claude & GPT (this session): ")
+    expect(lines[2]).toStartWith("Gemini: ")
+  })
+
+  test("omits refill times that have passed", () => {
+    const later = Date.parse("2026-12-01T00:00:00Z")
+    expect(quotaSummary(usage, later, null, "en-US")).not.toContain("refills")
+  })
+
+  test("shows agy's error", () => {
+    expect(quotaSummary({ ok: false, configured: true, error: "agy was not found", usage: null }, now)).toBe("agy was not found")
   })
 })

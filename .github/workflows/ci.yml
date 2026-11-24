@@ -25,4 +25,4 @@ jobs:
           bun x tsc --noEmit
           bun run test
           bun run build
-          git diff --exit-code -- service/main.js
+          git diff --exit-code -- service/main.js status/main.js command/main.js
