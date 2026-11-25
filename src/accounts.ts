@@ -49,14 +49,25 @@ function isValidId(id: unknown): id is string {
   return typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id) && id !== MAIN_ACCOUNT_ID
 }
 
+function readRegistry(env: NodeJS.ProcessEnv): unknown {
+  try {
+    return JSON.parse(fs.readFileSync(registryPath(env), "utf8"))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether the main provider (your normal agy login in ~/.gemini) is offered.
+ * On unless turned off with `agy-accounts main off`.
+ */
+export function mainAccountEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (readRegistry(env) as { main?: { enabled?: unknown } } | undefined)?.main?.enabled !== false
+}
+
 /** Accounts in the order they were added. A missing or unreadable file means none. */
 export function readAccounts(env: NodeJS.ProcessEnv = process.env): AntigravityAccount[] {
-  let raw: unknown
-  try {
-    raw = JSON.parse(fs.readFileSync(registryPath(env), "utf8"))
-  } catch {
-    return []
-  }
+  const raw = readRegistry(env)
   const list = (raw as { accounts?: unknown })?.accounts
   if (!Array.isArray(list)) return []
   const seen = new Set<string>()
@@ -72,11 +83,16 @@ export function readAccounts(env: NodeJS.ProcessEnv = process.env): AntigravityA
   return accounts
 }
 
-export function writeAccounts(accounts: readonly AntigravityAccount[], env: NodeJS.ProcessEnv = process.env): void {
+export function writeAccounts(
+  accounts: readonly AntigravityAccount[],
+  env: NodeJS.ProcessEnv = process.env,
+  mainEnabled: boolean = mainAccountEnabled(env),
+): void {
   const file = registryPath(env)
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, accounts }, null, 2)}\n`, { mode: 0o600 })
+  const registry = { version: 1, ...(mainEnabled ? {} : { main: { enabled: false } }), accounts }
+  fs.writeFileSync(tmp, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 })
   fs.renameSync(tmp, file)
 }
 

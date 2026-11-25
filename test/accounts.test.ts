@@ -10,6 +10,7 @@ import {
   accountProviderID,
   findAccount,
   hasSavedLogin,
+  mainAccountEnabled,
   isAntigravityProvider,
   newAccountId,
   prepareAccountHome,
@@ -98,6 +99,13 @@ describe("account registry", () => {
       )
       expect(readAccounts(env).map((a) => a.id)).toEqual(["work"])
       expect(findAccount(readAccounts(env), "WORK")?.id).toBe("work")
+      // The main account is on until turned off, and writing accounts keeps that.
+      expect(mainAccountEnabled(env)).toBe(true)
+      writeAccounts(readAccounts(env), env, false)
+      expect(mainAccountEnabled(env)).toBe(false)
+      writeAccounts([{ id: "work", name: "Work", createdAt: 1 }], env)
+      expect(mainAccountEnabled(env)).toBe(false)
+      expect(readAccounts(env).map((a) => a.id)).toEqual(["work"])
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }

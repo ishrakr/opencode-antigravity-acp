@@ -38,13 +38,18 @@ function accountHome(accountId, env = process.env) {
 function isValidId(id) {
   return typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id) && id !== MAIN_ACCOUNT_ID;
 }
-function readAccounts(env = process.env) {
-  let raw;
+function readRegistry(env) {
   try {
-    raw = JSON.parse(fs.readFileSync(registryPath(env), "utf8"));
+    return JSON.parse(fs.readFileSync(registryPath(env), "utf8"));
   } catch {
-    return [];
+    return;
   }
+}
+function mainAccountEnabled(env = process.env) {
+  return readRegistry(env)?.main?.enabled !== false;
+}
+function readAccounts(env = process.env) {
+  const raw = readRegistry(env);
   const list = raw?.accounts;
   if (!Array.isArray(list))
     return [];
@@ -227,7 +232,7 @@ function runAgyQuota(binary = resolveAgyBinary(), cwd = defaultCwd(), home) {
 }
 async function readAllQuotas(binary = resolveAgyBinary(), cwd = defaultCwd(), env = process.env) {
   const jobs = [
-    async () => ({ id: MAIN_ACCOUNT_ID, name: "Main", data: await runAgyQuota(binary, cwd) }),
+    ...mainAccountEnabled(env) ? [async () => ({ id: MAIN_ACCOUNT_ID, name: "Main", data: await runAgyQuota(binary, cwd) })] : [],
     ...readAccounts(env).map((account) => async () => {
       const home = accountHome(account.id, env);
       const data = hasSavedLogin(home) ? await runAgyQuota(binary, cwd, home) : failure(`Not signed in. Run: agy-accounts login "${account.name}"`);

@@ -87,7 +87,7 @@ describe("every account", () => {
     try {
       const state = path.join(dir, "state")
       const env = { ...process.env, ANTIGRAVITY_ACP_STATE_DIR: state }
-      const { writeAccounts, prepareAccountHome, accountHome } = await import("../../src/accounts.ts")
+      const { writeAccounts, prepareAccountHome, accountHome, readAccounts } = await import("../../src/accounts.ts")
       writeAccounts(
         [
           { id: "work", name: "Work", createdAt: 1 },
@@ -120,6 +120,11 @@ describe("every account", () => {
       expect(calls).toContain(
         `-p /quota --output-format json --gemini_dir ${workHome} --app_data_dir antigravity-acp | home=${workHome} file=1`,
       )
+
+      // With the main account turned off, only the extra accounts are read.
+      writeAccounts(readAccounts(env), env, false)
+      const without = await readAllQuotas(fake, dir, env)
+      expect(without.accounts.map((a) => a.id)).toEqual(["work", "spare"])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

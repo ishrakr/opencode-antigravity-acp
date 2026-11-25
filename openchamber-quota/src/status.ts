@@ -117,11 +117,11 @@ function render(): void {
   const now = Date.now()
   const accounts = toAccountViews(data, target)
   if (accounts.length === 0) {
-    note("agy reported no quota.")
+    note("No Antigravity accounts. Add one with: agy-accounts add <name>")
     return
   }
   // With only your normal login, the section looks as it did before accounts.
-  if (accounts.length === 1) {
+  if (accounts.length === 1 && accounts[0].id === "main") {
     root.replaceChildren(...drawGroups(accounts[0], now))
     return
   }

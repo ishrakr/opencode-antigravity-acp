@@ -44,13 +44,18 @@ function accountHome(accountId, env = process.env) {
 function isValidId(id) {
   return typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id) && id !== MAIN_ACCOUNT_ID;
 }
-function readAccounts(env = process.env) {
-  let raw;
+function readRegistry(env) {
   try {
-    raw = JSON.parse(fs.readFileSync(registryPath(env), "utf8"));
+    return JSON.parse(fs.readFileSync(registryPath(env), "utf8"));
   } catch {
-    return [];
+    return;
   }
+}
+function mainAccountEnabled(env = process.env) {
+  return readRegistry(env)?.main?.enabled !== false;
+}
+function readAccounts(env = process.env) {
+  const raw = readRegistry(env);
   const list = raw?.accounts;
   if (!Array.isArray(list))
     return [];
@@ -67,11 +72,12 @@ function readAccounts(env = process.env) {
   }
   return accounts;
 }
-function writeAccounts(accounts, env = process.env) {
+function writeAccounts(accounts, env = process.env, mainEnabled = mainAccountEnabled(env)) {
   const file = registryPath(env);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 448 });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, accounts }, null, 2)}
+  const registry = { version: 1, ...mainEnabled ? {} : { main: { enabled: false } }, accounts };
+  fs.writeFileSync(tmp, `${JSON.stringify(registry, null, 2)}
 `, { mode: 384 });
   fs.renameSync(tmp, file);
 }
@@ -234,6 +240,7 @@ var MAX_STDOUT_BUFFER_BYTES = 16 * 1024 * 1024;
 var USAGE = `Usage: agy-accounts <command>
 
   list                   Accounts, their OpenCode provider and whether they are signed in
+  main on|off            Offer or stop offering your normal agy login ("Antigravity (ACP)")
   add <name>             Add an account, such as "Work", and sign it in
   login <name>           Sign the account in again (or into another Google account)
   logout <name>          Delete the account's saved Google login
@@ -292,7 +299,11 @@ async function main(argv) {
         console.log(`${USAGE}
 `);
       const rows = [
-        ["Main", "antigravity-acp", "your normal agy login (~/.gemini)"],
+        [
+          "Main",
+          "antigravity-acp",
+          mainAccountEnabled() ? "your normal agy login (~/.gemini)" : "off (agy-accounts main on)"
+        ],
         ...accounts.map((a) => [
           a.name,
           accountProviderID(a.id),
@@ -305,6 +316,14 @@ async function main(argv) {
       if (accounts.length === 0)
         console.log(`
 No extra accounts yet. Add one with: agy-accounts add <name>`);
+      return 0;
+    }
+    case "main": {
+      const value = args[0];
+      if (value !== "on" && value !== "off")
+        throw new CliError("Usage: agy-accounts main on|off");
+      writeAccounts(accounts, process.env, value === "on");
+      console.log(value === "on" ? 'OpenCode offers your normal agy login again as "Antigravity (ACP)". Restart OpenCode.' : `OpenCode and the quota section no longer use your normal agy login. Restart OpenCode; "Antigravity (ACP)" disappears. Sessions on it stay readable but can't continue.`);
       return 0;
     }
     case "add": {

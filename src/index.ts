@@ -5,6 +5,7 @@ import {
   MAIN_PROVIDER_ID,
   accountProviderID,
   hasSavedLogin,
+  mainAccountEnabled,
   prepareAccountHome,
   readAccounts,
 } from "./accounts.js"
@@ -117,12 +118,17 @@ export default Plugin.define({
       for (const b of bridges.values()) {
         const { stale } = yield* Effect.promise(() => b.loadCachedModels())
         // A signed-out account would only fail to start agy.
-        if (stale && (!b.account.home || hasSavedLogin(b.account.home))) staleBridges.push(b)
+        const usable = b.account.home ? hasSavedLogin(b.account.home) : mainAccountEnabled()
+        if (stale && usable) staleBridges.push(b)
       }
 
+      // Turned off with `agy-accounts main off`: the main provider is not
+      // offered and never starts agy; its hooks stay so RPCs keep a target.
+      const mainEnabled = mainAccountEnabled()
       yield* ctx.provider.transform((editor) => {
         for (const [providerID, b] of bridges) {
           if (editor.get(providerID as any)) editor.remove(providerID as any)
+          if (providerID === MAIN_PROVIDER_ID && !mainEnabled) continue
           // An account whose models are not known yet (not signed in, or
           // still being read) stays out of the picker.
           if (b.getModels().length === 0) continue

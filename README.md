@@ -74,6 +74,7 @@ node ~/path/to/opencode-antigravity-acp/bin/agy-accounts.js add "Work"
 | Command | What it does |
 | :--- | :--- |
 | `agy-accounts list` | Accounts, their provider ID and whether they are signed in |
+| `agy-accounts main off` / `on` | Stop or start offering your normal `agy` login as **Antigravity (ACP)**; the quota section follows |
 | `agy-accounts add <name>` | Add an account and sign it in |
 | `agy-accounts login <name>` | Sign it in again, or into another Google account |
 | `agy-accounts logout <name>` | Delete its saved Google login |

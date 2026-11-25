@@ -4,7 +4,7 @@ An OpenChamber extension that adds an **Antigravity** section to Work Status: th
 
 It shows both groups in every session, always in the same order. In a session that uses an Antigravity model, the other group is dimmed.
 
-With [separate accounts](../README.md#separate-accounts) it lists every account under its name: your normal login as "Main", then each account you added. The order never changes; in an Antigravity session the other accounts are dimmed. An account that isn't signed in shows the command that signs it in. With only your normal login, the section looks as it always did.
+With [separate accounts](../README.md#separate-accounts) it lists every account under its name: your normal login as "Main" (unless turned off with `agy-accounts main off`), then each account you added. The order never changes; in an Antigravity session the other accounts are dimmed. An account that isn't signed in shows the command that signs it in. With only your normal login, the section looks as it always did.
 
 It adds no card to Settings → Usage, so Antigravity no longer appears in OpenChamber's general Usage section.
 

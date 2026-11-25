@@ -7,6 +7,7 @@ import readline from "node:readline/promises"
 import { resolveAgyBinary } from "./acp-client.js"
 import {
   accountAgyArgs,
+  mainAccountEnabled,
   accountAgyEnv,
   accountHome,
   accountProviderID,
@@ -25,6 +26,7 @@ import {
 const USAGE = `Usage: agy-accounts <command>
 
   list                   Accounts, their OpenCode provider and whether they are signed in
+  main on|off            Offer or stop offering your normal agy login ("Antigravity (ACP)")
   add <name>             Add an account, such as "Work", and sign it in
   login <name>           Sign the account in again (or into another Google account)
   logout <name>          Delete the account's saved Google login
@@ -88,7 +90,11 @@ async function main(argv: readonly string[]): Promise<number> {
     case undefined: {
       if (command === undefined) console.log(`${USAGE}\n`)
       const rows = [
-        ["Main", "antigravity-acp", "your normal agy login (~/.gemini)"],
+        [
+          "Main",
+          "antigravity-acp",
+          mainAccountEnabled() ? "your normal agy login (~/.gemini)" : "off (agy-accounts main on)",
+        ],
         ...accounts.map((a) => [
           a.name,
           accountProviderID(a.id),
@@ -98,6 +104,17 @@ async function main(argv: readonly string[]): Promise<number> {
       const widths = [0, 1].map((i) => Math.max(...rows.map((r) => r[i].length)))
       for (const r of rows) console.log(`${r[0].padEnd(widths[0])}  ${r[1].padEnd(widths[1])}  ${r[2]}`)
       if (accounts.length === 0) console.log("\nNo extra accounts yet. Add one with: agy-accounts add <name>")
+      return 0
+    }
+    case "main": {
+      const value = args[0]
+      if (value !== "on" && value !== "off") throw new CliError("Usage: agy-accounts main on|off")
+      writeAccounts(accounts, process.env, value === "on")
+      console.log(
+        value === "on"
+          ? 'OpenCode offers your normal agy login again as "Antigravity (ACP)". Restart OpenCode.'
+          : 'OpenCode and the quota section no longer use your normal agy login. Restart OpenCode; "Antigravity (ACP)" disappears. Sessions on it stay readable but can\'t continue.',
+      )
       return 0
     }
     case "add": {

@@ -9,6 +9,7 @@ import {
   accountAgyEnv,
   accountHome,
   hasSavedLogin,
+  mainAccountEnabled,
   readAccounts,
 } from "../../src/accounts.ts"
 
@@ -186,7 +187,9 @@ export async function readAllQuotas(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<AccountsQuota> {
   const jobs: Array<() => Promise<AccountQuota>> = [
-    async () => ({ id: MAIN_ACCOUNT_ID, name: "Main", data: await runAgyQuota(binary, cwd) }),
+    ...(mainAccountEnabled(env)
+      ? [async () => ({ id: MAIN_ACCOUNT_ID, name: "Main", data: await runAgyQuota(binary, cwd) })]
+      : []),
     ...readAccounts(env).map((account) => async (): Promise<AccountQuota> => {
       const home = accountHome(account.id, env)
       const data = hasSavedLogin(home)
