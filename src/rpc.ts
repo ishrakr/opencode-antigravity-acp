@@ -98,7 +98,9 @@ export const AcpRpc = Rpc.define({
     reloadModels: {
       input: {
         type: "object",
-        properties: {},
+        properties: {
+          providerID: { type: "string" },
+        },
         additionalProperties: false,
       },
       output: {

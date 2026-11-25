@@ -3,10 +3,8 @@ import type {
   LanguageModelV3ToolResultOutput,
 } from "@ai-sdk/provider"
 import type { AcpContentBlock } from "./acp-client.js"
-import { MAIN_PROVIDER_ID, isAntigravityProvider } from "./account-ids.js"
+import { isAntigravityProvider } from "./account-ids.js"
 import { isAcpToolName } from "./tool-display.js"
-
-export const ACP_PROVIDER_ID = MAIN_PROVIDER_ID
 
 /** The Antigravity entry of a metadata record, under any account's provider key. */
 function antigravityEntry(record: unknown): unknown {
@@ -365,20 +363,20 @@ const TEXT_MIME_TYPES = new Set([
 
 /** Same limits as T3 Code: 1 MiB per text file, 50 MiB of native attachments per message. */
 export const MAX_TEXT_ATTACHMENT_BYTES = 1024 * 1024
-export const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024
+const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 /**
  * Writes an attachment where agy can read it and returns its `file://` URI.
  * agy cannot take a PDF inline ("unsupported blob type"), only as a link to a
  * file inside its workspace or an `--add-dir`.
  */
-export type AttachmentStore = (input: {
+type AttachmentStore = (input: {
   readonly bytes: Uint8Array
   readonly filename: string
   readonly mediaType: string
 }) => string | undefined
 
-export interface AcpPromptOptions {
+interface AcpPromptOptions {
   readonly storeAttachment?: AttachmentStore
 }
 
@@ -545,7 +543,7 @@ export function hasNonAcpAssistantHistory(prompt: LanguageModelV3Prompt): boolea
 /**
  * Local plugin status/cooldown replies (circuit-open, restart-skip, missing
  * CLI) are emitted by `createImmediateTextStream` with a
- * `{ [ACP_PROVIDER_ID]: { localStatus: true } }` marker. They are neither ACP
+ * `{ [providerID]: { localStatus: true } }` marker. They are neither ACP
  * turns nor foreign model turns and must be skipped when scanning history.
  */
 export function isLocalStatusMessage(msg: LanguageModelV3Prompt[number]): boolean {

@@ -92,7 +92,7 @@ function makeBridge(options: {
 }) {
   const procs: FakeProc[] = []
   let sessionSeq = 0
-  const bridge = new SessionBridgeManager(options.ctx, "/tmp/acp-test-dir", undefined, {
+  const bridge = new SessionBridgeManager(options.ctx, "/tmp/acp-test-dir", {
     attachmentsDir: options.attachmentsDir ?? tmpDir(),
     createProc: (procOpts) => {
       const state: FakeProc = { prompts: [], closed: [], extraDirs: procOpts.extraDirs ?? [], models: [] }

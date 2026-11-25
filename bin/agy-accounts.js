@@ -104,6 +104,9 @@ function findAccount(accounts, query) {
   const q = query.trim().toLowerCase();
   return accounts.find((a) => a.name.toLowerCase() === q) ?? accounts.find((a) => a.id === q);
 }
+function accountAgyArgs(home) {
+  return ["--gemini_dir", home, "--app_data_dir", ACCOUNT_APP_DATA_DIR];
+}
 var FOREIGN_CREDENTIAL_KEYS = [
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
@@ -260,7 +263,7 @@ function runLogin(account) {
   console.log(`Signing in "${account.name}". Open the link agy prints, sign in with the Google account for "${account.name}", then paste the code here.
 `);
   return new Promise((resolve) => {
-    const child = spawn(binary, ["acp", "--gemini_dir", home, "--app_data_dir", ACCOUNT_APP_DATA_DIR, "--login"], { cwd: home, env: accountAgyEnv(home), stdio: "inherit" });
+    const child = spawn(binary, ["acp", ...accountAgyArgs(home), "--login"], { cwd: home, env: accountAgyEnv(home), stdio: "inherit" });
     child.on("error", (err) => {
       console.error(`Could not start agy (${binary}): ${err.message}. Install the Antigravity CLI or set AGY_BIN.`);
       resolve(false);

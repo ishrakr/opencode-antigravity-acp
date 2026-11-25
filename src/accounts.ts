@@ -28,7 +28,7 @@ export interface AntigravityAccount {
   readonly createdAt: number
 }
 
-export function stateDir(env: NodeJS.ProcessEnv = process.env): string {
+function stateDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.ANTIGRAVITY_ACP_STATE_DIR?.trim()
   if (override) return override
   const home = env.HOME || os.homedir()

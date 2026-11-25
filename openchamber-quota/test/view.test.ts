@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test"
 import {
   antigravityTargetOf,
   groupMatchesModel,
-  quotaSummary,
   readAccountsQuota,
   shortGroupName,
   toAccountViews,
@@ -87,38 +86,6 @@ describe("group views", () => {
   })
 })
 
-describe("/agy-quota summary", () => {
-  const now = Date.parse("2026-11-23T20:00:00Z")
-
-  test("lists every group with what is left and when it refills", () => {
-    const text = quotaSummary(main(), now, null, "en-US")
-    const lines = text.split("\n")
-    expect(lines[0]).toBe("Antigravity quota")
-    expect(lines[1]).toStartWith("Gemini: 5-hour 94% left, refills ")
-    expect(lines[1]).toContain("Weekly 97% left, refills ")
-    expect(lines[2]).toStartWith("Claude & GPT: 5-hour 100% left")
-    expect(lines[2]).toContain("Weekly 42% left")
-    expect(text).not.toContain("this session")
-    expect(text.length).toBeLessThanOrEqual(500)
-  })
-
-  test("keeps the same order in an Antigravity session, unlabelled", () => {
-    const lines = quotaSummary(main(), now, { account: "main", modelId: "claude-opus-5-5" }, "en-US").split("\n")
-    expect(lines[1]).toStartWith("Gemini: ")
-    expect(lines[2]).toStartWith("Claude & GPT: ")
-    expect(lines.join("\n")).not.toContain("this session")
-  })
-
-  test("omits refill times that have passed", () => {
-    const later = Date.parse("2026-12-01T00:00:00Z")
-    expect(quotaSummary(main(), later, null, "en-US")).not.toContain("refills")
-  })
-
-  test("shows agy's error", () => {
-    expect(quotaSummary(main(failure("agy was not found")), now)).toBe("agy was not found")
-  })
-})
-
 describe("refill times", () => {
   test("a window agy has not started has no refill time", () => {
     const unused = toUsageData({
@@ -158,27 +125,6 @@ describe("several accounts", () => {
     const views = toAccountViews(quota)
     expect(views.map((v) => v.name)).toEqual(["Main", "Work", "Spare"])
     expect(views.some((v) => v.current)).toBe(false)
-  })
-
-  test("the summary names each account and fits a toast", () => {
-    const text = quotaSummary(quota, now, { account: "work", modelId: "claude-opus-5-5" }, "en-US")
-    const lines = text.split("\n")
-    expect(lines[1]).toBe("Main")
-    expect(lines[2]).toStartWith("  Gemini: ")
-    expect(text).not.toContain("this session")
-    expect(text).toContain("\nWork\n  Gemini: ")
-    expect(text).toContain('  Not signed in. Run: agy-accounts login "Spare"')
-    expect(text.length).toBeLessThanOrEqual(500)
-  })
-
-  test("refill times go first when every account would not fit", () => {
-    const many: AccountsQuota = {
-      accounts: Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, name: `Account ${i}`, data: usage })),
-    }
-    const text = quotaSummary(many, now, null, "en-US")
-    expect(text).not.toContain("refills")
-    expect(text).toContain("Account 3")
-    expect(text.length).toBeLessThanOrEqual(500)
   })
 
   test("an older service's single-account answer still reads", () => {

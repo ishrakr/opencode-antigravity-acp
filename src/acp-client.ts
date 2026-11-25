@@ -79,7 +79,7 @@ export interface AcpDiscoveredModel {
   readonly defaultAcpModelId: string
 }
 
-export interface AcpPermissionOption {
+interface AcpPermissionOption {
   readonly optionId: string
   readonly name?: string
   readonly kind?: string
@@ -413,7 +413,6 @@ export interface AcpProcessOptions {
   readonly accountHome?: string
   readonly binaryPath?: string
   readonly extraDirs?: readonly string[]
-  readonly dangerouslySkipPermissions?: boolean
   readonly onUpdate?: (sessionId: string, update: AcpSessionUpdate) => void
   readonly onPermissionRequest?: (
     params: AcpPermissionRequestParams,
@@ -421,7 +420,6 @@ export interface AcpProcessOptions {
   /** Answers form elicitations such as `ask_question`. Without it, forms are declined. */
   readonly onElicitation?: (params: AcpElicitationRequestParams) => Promise<AcpElicitationResponse>
   readonly onExit?: (code: number | null, signal: NodeJS.Signals | null, stderrTail: string) => void
-  readonly onLog?: (level: "warn" | "debug", message: string, meta?: Record<string, unknown>) => void
 }
 
 interface PendingRpc {
@@ -436,7 +434,7 @@ const MAX_STDOUT_BUFFER_BYTES = 16 * 1024 * 1024
 
 const MAX_STDERR_LINES = 200
 
-export type AcpAuthMethodId =
+type AcpAuthMethodId =
   | "oauth-personal"
   | "oauth-business"
   | "gemini-api-key"
@@ -593,9 +591,6 @@ export class AcpProcess {
     this.auth = options.auth ?? { method: "oauth-personal" }
     const args = ["acp", "--stdio", "--process-per-session"]
     if (options.accountHome) args.push(...accountAgyArgs(options.accountHome))
-    if (options.dangerouslySkipPermissions) {
-      args.push("--dangerously-skip-permissions")
-    }
     for (const dir of options.extraDirs ?? []) {
       if (dir) args.push("--add-dir", dir)
     }
@@ -753,9 +748,6 @@ export class AcpProcess {
     try {
       msg = JSON.parse(line)
     } catch {
-      this.options.onLog?.("warn", "Ignoring malformed ACP JSON line", {
-        line: line.slice(0, 500),
-      })
       return
     }
 
@@ -763,9 +755,6 @@ export class AcpProcess {
     if (msg.id !== undefined && msg.method === undefined) {
       const entry = this.pending.get(Number(msg.id))
       if (!entry) {
-        this.options.onLog?.("debug", "Ignoring late ACP response for removed request", {
-          id: msg.id,
-        })
         return
       }
       if (entry.timer) clearTimeout(entry.timer)
@@ -810,10 +799,7 @@ export class AcpProcess {
           ? await this.options.onPermissionRequest(params as AcpPermissionRequestParams)
           : await this.fallbackAutoSelect(params)
         this.write({ jsonrpc: "2.0", id, result: { outcome } })
-      } catch (err) {
-        this.options.onLog?.("warn", "onPermissionRequest failed; auto-cancelling", {
-          error: err instanceof Error ? err.message : String(err),
-        })
+      } catch {
         this.write({
           jsonrpc: "2.0",
           id,
@@ -829,10 +815,7 @@ export class AcpProcess {
         result = this.options.onElicitation
           ? await this.options.onElicitation((params ?? {}) as AcpElicitationRequestParams)
           : { action: "decline" }
-      } catch (err) {
-        this.options.onLog?.("warn", "onElicitation failed; cancelling", {
-          error: err instanceof Error ? err.message : String(err),
-        })
+      } catch {
         result = { action: "cancel" }
       }
       this.write({ jsonrpc: "2.0", id, result })
@@ -955,7 +938,7 @@ export class AcpProcess {
         // Form elicitation makes agy send `ask_question` as `elicitation/create`,
         // which supports multiple questions, multi-select and typed answers.
         clientCapabilities: { elicitation: { form: {} } },
-        clientInfo: { name: "acp-bridge", version: "0.3.0" },
+        clientInfo: { name: "acp-bridge", version: "0.5.0" },
       },
       15_000,
     )

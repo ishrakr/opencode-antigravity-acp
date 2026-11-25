@@ -1,6 +1,6 @@
 {
   "name": "@ishrakr/opencode-antigravity-acp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Run Google Antigravity as the agent in OpenCode through the official agy acp protocol, as an ACP client like T3 Code and Zed.",
   "author": "system1970",
   "license": "MIT",
@@ -46,6 +46,7 @@
   "devDependencies": {
     "@ai-sdk/provider": "^3.0.0",
     "@opencode/plugin": "2.4.1",
+    "@types/bun": "1.4.2",
     "@types/node": "^22.0.0",
     "effect": "4.1.0",
     "solid-js": "^1.9.0",

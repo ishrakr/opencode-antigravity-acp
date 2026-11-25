@@ -193,12 +193,6 @@ const css = `
   user-select: none;
 }
 
-.agy-sec-badge {
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 15px;
-  color: var(--v2-text-text-muted, #aeaeae);
-}
 
 .agy-mode-grid {
   display: grid;
@@ -288,7 +282,7 @@ interface AcpRpcClient {
   resetSession(input: { readonly sessionID: string } & AccountTarget, options?: RpcCallOptions): Promise<AcpSessionState>
   warmSession(input: { readonly sessionID?: string } & AccountTarget, options?: RpcCallOptions): Promise<AcpSessionState>
   reloadModels(
-    input: Record<string, never>,
+    input: AccountTarget,
     options?: RpcCallOptions,
   ): Promise<{ readonly modelCount: number }>
 }
@@ -589,7 +583,7 @@ export default Plugin.define({
         setActionError(null)
         setReloading(true)
         try {
-          const res = await getRpc().reloadModels({}, buildOpts(dir))
+          const res = await getRpc().reloadModels(accountOf(sid), buildOpts(dir))
           void fetchState(sid, dir, true)
           ctx.toast.show({
             title: "Antigravity models refreshed",
@@ -781,7 +775,7 @@ export default Plugin.define({
         slash: { name: "agy-reload" },
         run: async () => {
           const target = currentSessionTarget()
-          const res = await getRpc().reloadModels({}, buildOpts(target?.directory))
+          const res = await getRpc().reloadModels(target ? accountOf(target.sessionID) : {}, buildOpts(target?.directory))
           if (target) void fetchState(target.sessionID, target.directory, true)
           ctx.toast.show({
             title: "Antigravity models refreshed",

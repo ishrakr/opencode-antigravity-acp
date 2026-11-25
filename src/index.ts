@@ -4,6 +4,7 @@ import { isLegacyAcpModel, resolveAcpAuthConfig, type AcpDiscoveredModel } from 
 import {
   MAIN_PROVIDER_ID,
   accountProviderID,
+  hasSavedLogin,
   prepareAccountHome,
   readAccounts,
 } from "./accounts.js"
@@ -78,11 +79,20 @@ export default Plugin.define({
       // Your normal agy login, then one provider per extra account (as in
       // T3 Code). A session uses the account whose model it picked; nothing
       // switches accounts on its own. Accounts load when OpenCode starts.
-      const bridge = new SessionBridgeManager(ctx, ctx.location.directory, undefined, {
+      const bridges = new Map<string, SessionBridgeManager>()
+      // A session you moved to another account: the accounts it left stop
+      // their process for it, so only one account works on a session.
+      const releaseElsewhere = (providerID: string) => async (sessionID: string) => {
+        for (const [id, b] of bridges) {
+          if (id !== providerID && b.hasSession(sessionID)) await b.resetSession(sessionID)
+        }
+      }
+      const bridge = new SessionBridgeManager(ctx, ctx.location.directory, {
         auth,
         onCatalogChanged: reloadProviders,
+        onSessionMoved: releaseElsewhere(MAIN_PROVIDER_ID),
       })
-      const bridges = new Map<string, SessionBridgeManager>([[MAIN_PROVIDER_ID, bridge]])
+      bridges.set(MAIN_PROVIDER_ID, bridge)
       for (const account of readAccounts()) {
         let home: string
         try {
@@ -92,11 +102,12 @@ export default Plugin.define({
         }
         bridges.set(
           accountProviderID(account.id),
-          new SessionBridgeManager(ctx, ctx.location.directory, undefined, {
+          new SessionBridgeManager(ctx, ctx.location.directory, {
             // Extra accounts always sign in with their own Google login.
             auth: { method: "oauth-personal" },
             account: { id: account.id, name: account.name, home },
             onCatalogChanged: reloadProviders,
+            onSessionMoved: releaseElsewhere(accountProviderID(account.id)),
           }),
         )
       }
@@ -110,14 +121,21 @@ export default Plugin.define({
         Effect.promise(() => Promise.all([...bridges.values()].map((b) => b.disposeAll()))),
       )
 
-      const cacheStatus = yield* Effect.promise(() => bridge.loadCachedModels())
-      for (const other of bridges.values()) {
-        if (other !== bridge) yield* Effect.promise(() => other.loadCachedModels())
+      // Each account lists only the models Google allows it, read from its
+      // own agy; a stale or missing list is read again in the background.
+      const staleBridges: SessionBridgeManager[] = []
+      for (const b of bridges.values()) {
+        const { stale } = yield* Effect.promise(() => b.loadCachedModels())
+        // A signed-out account would only fail to start agy.
+        if (stale && (!b.account.home || hasSavedLogin(b.account.home))) staleBridges.push(b)
       }
 
       yield* ctx.provider.transform((editor) => {
         for (const [providerID, b] of bridges) {
           if (editor.get(providerID as any)) editor.remove(providerID as any)
+          // An account whose models are not known yet (not signed in, or
+          // still being read) stays out of the picker.
+          if (b.getModels().length === 0) continue
           const name = accountNames.get(providerID)
           editor.add({
             info: {
@@ -161,7 +179,6 @@ export default Plugin.define({
             Effect.sync(() => {
               input.headers["x-opencode-session-id"] = input.sessionID
               input.headers["x-opencode-request-kind"] = input.kind
-              input.headers["x-opencode-agent"] = input.agent
               input.headers["x-opencode-variant"] = input.model.variant ?? ""
             }),
           { providerID: providerID as any },
@@ -246,19 +263,19 @@ export default Plugin.define({
           const { sessionID, providerID } = input as { sessionID?: string; providerID?: string }
           return Effect.promise(() => bridgeForRpc(providerID).warmSession(sessionID))
         },
-        reloadModels: () =>
+        reloadModels: (input) =>
           Effect.gen(function* () {
-            const { models } = yield* Effect.promise(() => bridge.refreshModels({ force: true }))
+            const { providerID } = (input ?? {}) as { providerID?: string }
+            const target = bridgeForRpc(providerID)
+            const { models } = yield* Effect.promise(() => target.refreshModels({ force: true }))
             yield* ctx.provider.reload()
             return { modelCount: models.length }
           }).pipe(Effect.orDie),
       })
 
-      if (cacheStatus.stale) {
+      for (const b of staleBridges) {
         yield* Effect.forkScoped(
-          Effect.promise(() => bridge.refreshModelsInBackground()).pipe(
-            Effect.catch(() => Effect.void),
-          ),
+          Effect.promise(() => b.refreshModelsInBackground()).pipe(Effect.catch(() => Effect.void)),
         )
       }
 

@@ -18,6 +18,9 @@ jobs:
       - run: bun run typecheck
       - run: bun run test
       - run: bun run build:gui
+      - run: bun run build:cli
+      - name: Committed bundles are up to date
+        run: git diff --exit-code -- dist/gui-experimental.cjs bin/agy-accounts.js
       - name: OpenChamber quota extension
         working-directory: openchamber-quota
         run: |
@@ -25,4 +28,4 @@ jobs:
           bun x tsc --noEmit
           bun run test
           bun run build
-          git diff --exit-code -- service/main.js status/main.js command/main.js
+          git diff --exit-code -- service/main.js status/main.js

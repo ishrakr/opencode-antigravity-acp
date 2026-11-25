@@ -8,7 +8,7 @@ import type { AcpSessionUpdate } from "./acp-client.js"
  * dotted segment (OpenChamber) still pick the matching renderer.
  */
 
-export const ACP_TOOL_PREFIX = "antigravity."
+const ACP_TOOL_PREFIX = "antigravity."
 
 export function isAcpToolName(name: unknown): boolean {
   const n = String(name ?? "")
@@ -52,7 +52,7 @@ const DISPLAY_NAME: Record<Shape, string> = {
   webfetch: "webfetch",
 }
 
-export interface AcpToolDisplay {
+interface AcpToolDisplay {
   readonly name: string
   readonly input: Record<string, unknown>
 }

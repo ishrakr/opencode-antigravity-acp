@@ -61,7 +61,7 @@ For the Google account methods, sign in once with `agy` (or `agy acp --login` ov
 
 ## Separate accounts
 
-Like T3 Code, the plugin can run more than one Google account side by side. Your normal `agy` login stays the **Antigravity (ACP)** provider. Each extra account becomes its own provider, such as **Antigravity (Work)**, with the same models and its own private folder and sign-in. You choose the account for a session by picking one of its models. Nothing switches accounts on its own, not even when one runs out of quota.
+Like T3 Code, the plugin can run more than one Google account side by side. Your normal `agy` login stays the **Antigravity (ACP)** provider. Each extra account becomes its own provider, such as **Antigravity (Work)**, listing only the models Google allows that account, with its own private folder and sign-in. An account appears once it is signed in and its models are read (in the background after OpenCode starts; `/agy-reload` reads them again). You choose the account for a session by picking one of its models. Nothing switches accounts on its own, not even when one runs out of quota.
 
 Add and sign in an account in a terminal:
 
@@ -83,7 +83,7 @@ node ~/path/to/opencode-antigravity-acp/bin/agy-accounts.js add "Work"
 - Each account lives in `~/.local/state/opencode-antigravity-acp/accounts/<id>` (set `ANTIGRAVITY_ACP_STATE_DIR` to move it). As in T3 Code, the plugin starts `agy` with that folder as `GEMINI_HOME`, `--gemini_dir` and `--app_data_dir antigravity-acp`, with `AGY_ACP_FORCE_FILE_STORAGE=1` and a placeholder `SSH_CONNECTION`, so the login is kept in a file in that folder instead of the OS keyring entry every account would share. Google API keys and Cloud variables are removed from its environment.
 - Your `AGENTS.md`, `GEMINI.md` and skills in `~/.gemini` are linked into each folder, so every account follows the same rules. Logins and MCP settings stay separate.
 - Extra accounts always use their own Google login, whatever `authMethod` the main provider uses.
-- A session stays on one account. Antigravity keeps each conversation on the account that held it, so after another account has replied in a session, a different account's models decline to continue it, as they do for another model's replies. Start a new session instead.
+- **Switching a session to another account:** pick a model under the other account. Its next reply starts a new Antigravity conversation on that account, is given the conversation so far (as after a rewind), and says it switched; the account you left stops its process for that session. Nothing switches on its own. A session that has replies from a non-Antigravity model still can't be continued by Antigravity.
 - A signed-out account answers with the command to sign it in.
 
 ---
@@ -169,7 +169,7 @@ When an **Antigravity (ACP)** model is active, an **`ACP`** pill appears above t
 
 ## Quota in OpenChamber
 
-[`openchamber-quota/`](./openchamber-quota) is an OpenChamber extension that shows your Antigravity 5-hour and weekly limits per model group in an **Antigravity** section of Work Status, and in a notification when you type `/agy-quota` in the chat box. It reads them from `agy`'s own `/quota` command, for your normal `agy` login and every [separate account](#separate-accounts), and runs no model turn. Add the folder in **Settings → Extensions** and allow its local service.
+[`openchamber-quota/`](./openchamber-quota) is an OpenChamber extension that shows your Antigravity 5-hour and weekly limits per model group in an **Antigravity** section of Work Status. It reads them from `agy`'s own `/quota` command, for your normal `agy` login and every [separate account](#separate-accounts), and runs no model turn. Add the folder in **Settings → Extensions** and allow its local service.
 
 ---
 

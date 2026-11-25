@@ -27,6 +27,9 @@ jobs:
       - run: bun run typecheck
       - run: bun run test
       - run: bun run build:gui
+      - run: bun run build:cli
+      - name: Committed bundles are up to date
+        run: git diff --exit-code -- dist/gui-experimental.cjs bin/agy-accounts.js
       - name: Tag must match package.json version
         run: |
           TAG="${GITHUB_REF_NAME#v}"

@@ -15,7 +15,7 @@ export interface OpenCodeQuestion {
   readonly multiple?: boolean
 }
 
-export interface BridgedQuestions {
+interface BridgedQuestions {
   readonly questions: readonly OpenCodeQuestion[]
   /**
    * Maps answers (labels or typed text, per question) back to elicitation
@@ -25,7 +25,7 @@ export interface BridgedQuestions {
   readonly respond: (answers: ReadonlyArray<readonly string[] | undefined>) => AcpElicitationContent | undefined
 }
 
-export type AcpElicitationContent = Record<string, string | string[]>
+type AcpElicitationContent = Record<string, string | string[]>
 
 interface Choice {
   readonly label: string
@@ -152,7 +152,7 @@ export function isAcpUserInputRequest(params: AcpPermissionRequestParams): boole
   return String(params.toolCall?.toolCallId ?? "").startsWith("interaction_")
 }
 
-export interface BridgedChoiceQuestion {
+interface BridgedChoiceQuestion {
   readonly question: OpenCodeQuestion
   /** The optionId for the chosen label, or `undefined` when unanswered. */
   readonly respond: (answer: readonly string[] | undefined) => string | undefined

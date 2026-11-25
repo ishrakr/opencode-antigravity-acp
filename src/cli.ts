@@ -6,7 +6,7 @@ import fs from "node:fs"
 import readline from "node:readline/promises"
 import { resolveAgyBinary } from "./acp-client.js"
 import {
-  ACCOUNT_APP_DATA_DIR,
+  accountAgyArgs,
   accountAgyEnv,
   accountHome,
   accountProviderID,
@@ -56,7 +56,7 @@ function runLogin(account: AntigravityAccount): Promise<boolean> {
   return new Promise((resolve) => {
     const child = spawn(
       binary,
-      ["acp", "--gemini_dir", home, "--app_data_dir", ACCOUNT_APP_DATA_DIR, "--login"],
+      ["acp", ...accountAgyArgs(home), "--login"],
       { cwd: home, env: accountAgyEnv(home), stdio: "inherit" },
     )
     child.on("error", (err) => {

@@ -3,7 +3,7 @@
 /** The provider of your normal `agy` login in `~/.gemini`. */
 export const MAIN_PROVIDER_ID = "antigravity-acp"
 export const MAIN_ACCOUNT_ID = "main"
-export const ACCOUNT_PROVIDER_PREFIX = `${MAIN_PROVIDER_ID}-`
+const ACCOUNT_PROVIDER_PREFIX = `${MAIN_PROVIDER_ID}-`
 
 /** True for the main provider and every account's provider. */
 export function isAntigravityProvider(providerID: unknown): providerID is string {

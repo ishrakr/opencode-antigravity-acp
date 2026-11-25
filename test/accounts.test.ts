@@ -19,7 +19,12 @@ import {
   writeAccounts,
 } from "../src/accounts.js"
 import { hasNonAcpAssistantHistory, isLocalStatusMessage } from "../src/history-sanitizer.js"
-import { FOREIGN_HISTORY_MESSAGE, SessionBridgeManager } from "../src/session-bridge.js"
+import {
+  FOREIGN_HISTORY_MESSAGE,
+  SessionBridgeManager,
+  accountSwitchNotice,
+  resetSharedCatalogForTests,
+} from "../src/session-bridge.js"
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "agy-accounts-"))
@@ -182,8 +187,8 @@ describe("account bridges", () => {
         },
       } as any
     }
-    const main = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, { createProc: fakeProc("acp-main") })
-    const work = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
+    const main = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", { createProc: fakeProc("acp-main") })
+    const work = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
       createProc: fakeProc("acp-work"),
       account: { id: "work", name: "Work", home: "/acct/work" },
     })
@@ -212,7 +217,7 @@ describe("account bridges", () => {
     }
   })
 
-  test("a session stays on its account: another account's replies lock it like another model's", async () => {
+  test("a reply whose provider cannot be confirmed locks the session like another model's", async () => {
     const main = [{ role: "user", content: [{ type: "text", text: "hi" }] }]
     const fromWork = {
       role: "assistant",
@@ -228,7 +233,7 @@ describe("account bridges", () => {
 
     // OpenCode hands a reply's metadata only to its own provider: on another
     // account it arrives without the marker, so that account declines it.
-    const bridge = new SessionBridgeManager(makeCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeCtx(), "/tmp/acp-test-dir", {
       account: { id: "spare", name: "Spare", home: "/acct/spare" },
       createProc: () => {
         throw new Error("must not start agy")
@@ -251,7 +256,7 @@ describe("account bridges", () => {
   })
 
   test("a signed-out account says how to sign in", async () => {
-    const bridge = new SessionBridgeManager(makeCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeCtx(), "/tmp/acp-test-dir", {
       account: { id: "spare", name: "Spare", home: "/acct/spare" },
       createProc: () =>
         ({
@@ -274,5 +279,121 @@ describe("account bridges", () => {
     } finally {
       await bridge.disposeAll()
     }
+  })
+
+  test("each account lists only the models its own agy offers", async () => {
+    resetSharedCatalogForTests()
+    const store = new Map<string, unknown>()
+    const ctx = makeCtx(store)
+    const model = (id: string) => ({ id, name: id, variants: [], defaultAcpModelId: id })
+    const main = new SessionBridgeManager(ctx, "/tmp/w", {
+      discoverModels: async () => [model("gemini-4-neon"), model("claude-opus-5-5")],
+    })
+    const work = new SessionBridgeManager(ctx, "/tmp/w", {
+      account: { id: "work", name: "Work", home: "/acct/work" },
+      discoverModels: async () => [model("gemini-3.8-flash")],
+    })
+    try {
+      // Before its list is read, an extra account offers nothing.
+      expect(work.getModels()).toEqual([])
+      expect(main.getModels().length).toBeGreaterThan(0)
+      await Promise.all([main.refreshModels({ force: true }), work.refreshModels({ force: true })])
+      expect(main.getModels().map((m) => m.id)).toEqual(["gemini-4-neon", "claude-opus-5-5"])
+      expect(work.getModels().map((m) => m.id)).toEqual(["gemini-3.8-flash"])
+      expect((store.get("antigravity-acp:account:work:model-catalog:v1") as any).models).toHaveLength(1)
+      expect((store.get("antigravity-acp:model-catalog:v1") as any).models).toHaveLength(2)
+      // After a restart each account reads its own saved list.
+      resetSharedCatalogForTests()
+      const again = new SessionBridgeManager(ctx, "/tmp/w", {
+        account: { id: "work", name: "Work", home: "/acct/work" },
+      })
+      expect((await again.loadCachedModels()).stale).toBe(false)
+      expect(again.getModels().map((m) => m.id)).toEqual(["gemini-3.8-flash"])
+      await again.disposeAll()
+    } finally {
+      await Promise.all([main.disposeAll(), work.disposeAll()])
+      resetSharedCatalogForTests()
+    }
+  })
+
+  describe("switching a session to another account", () => {
+    const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] })
+    // On the new account, the other account's reply arrives without a marker.
+    const history = [user("first question"), { role: "assistant", content: [{ type: "text", text: "answer from Work" }] }, user("next")]
+    const stored = (providers: string[]) =>
+      [
+        ...providers.map((providerID) => ({
+          type: "assistant",
+          model: { id: "gemini-4-neon", providerID },
+          time: { created: 1, completed: 2 },
+        })),
+        // The reply being written on this account, not finished yet.
+        { type: "assistant", model: { id: "gemini-4-neon", providerID: "antigravity-acp-spare" }, time: { created: 3 } },
+      ]
+
+    function spareBridge(replies: unknown[], prompts: unknown[][], onSessionMoved?: (sid: string) => Promise<void>) {
+      const ctx = makeCtx()
+      ctx.session.context = () => Effect.succeed(replies)
+      return new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
+        account: { id: "spare", name: "Spare", home: "/acct/spare" },
+        onSessionMoved,
+        createProc: (opts: any) =>
+          ({
+            isClosed: false,
+            initialize: async () => ({}),
+            authenticate: async () => ({}),
+            newSession: async () => ({ sessionId: "acp-spare" }),
+            setModel: async () => {},
+            setMode: async () => {},
+            notifyCancel: () => {},
+            dispose: async () => {},
+            closeSession: async () => {},
+            prompt: async (sid: string, blocks: unknown[]) => {
+              prompts.push(blocks)
+              opts.onUpdate?.(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } })
+              return { stopReason: "end_turn" }
+            },
+          }) as any,
+      })
+    }
+
+    test("carries the conversation over, says so, and releases the old account", async () => {
+      const prompts: unknown[][] = []
+      const released: string[] = []
+      const bridge = spareBridge(stored(["antigravity-acp-work"]), prompts, async (sid) => void released.push(sid))
+      try {
+        const { stream } = await bridge.createLanguageModel("gemini-4-neon").doStream({
+          prompt: history,
+          headers: { "x-opencode-session-id": "ses-move" },
+        } as any)
+        const text = (await readAll(stream)).filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
+        expect(text).toStartWith(accountSwitchNotice("Spare"))
+        expect(released).toEqual(["ses-move"])
+        const sent = JSON.stringify(prompts[0])
+        expect(sent).toContain("moved here from another Antigravity account")
+        expect(sent).toContain("answer from Work")
+        expect(sent).toContain("next")
+      } finally {
+        await bridge.disposeAll()
+      }
+    })
+
+    test("another model's replies still lock the session", async () => {
+      const prompts: unknown[][] = []
+      for (const replies of [stored(["antigravity-acp-work", "fs-cortex"]), stored([])]) {
+        const bridge = spareBridge(replies, prompts)
+        try {
+          const { stream } = await bridge.createLanguageModel("gemini-4-neon").doStream({
+            prompt: history,
+            headers: { "x-opencode-session-id": "ses-lock" },
+          } as any)
+          const text = (await readAll(stream)).filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
+          expect(text).toBe(FOREIGN_HISTORY_MESSAGE)
+        } finally {
+          await bridge.disposeAll()
+        }
+      }
+      expect(prompts).toEqual([])
+    })
   })
 })

@@ -53,7 +53,7 @@ function countCompactions(prompt: LanguageModelV3Prompt): number {
   return n
 }
 
-export interface TurnHistory {
+interface TurnHistory {
   /** For each of OpenCode's user messages, a fingerprint of it and every earlier one. */
   readonly hashes: readonly string[]
   readonly compactions: number
@@ -109,7 +109,10 @@ function messageText(msg: LanguageModelV3Prompt[number]): string {
  * The conversation kept before the latest message, for a fresh agy session.
  * Newest messages win when it is too long. `undefined` when nothing was kept.
  */
-export function buildKeptConversation(prompt: LanguageModelV3Prompt): string | undefined {
+export function buildKeptConversation(
+  prompt: LanguageModelV3Prompt,
+  reason = "Messages in this conversation were rewound or edited, so it continues in a new session.",
+): string | undefined {
   const nonSystem = prompt.filter((m) => m.role === "user" || m.role === "assistant")
   let lastUser = nonSystem.length - 1
   while (lastUser >= 0 && nonSystem[lastUser].role !== "user") lastUser--
@@ -127,7 +130,7 @@ export function buildKeptConversation(prompt: LanguageModelV3Prompt): string | u
   if (entries.length === 0) return undefined
   return [
     "<earlier_conversation>",
-    "Messages in this conversation were rewound or edited, so it continues in a new session. This is the conversation so far; continue from it. Files may differ from what it describes.",
+    `${reason} This is the conversation so far; continue from it. Files may differ from what it describes.`,
     "",
     entries.join("\n\n"),
     "</earlier_conversation>",

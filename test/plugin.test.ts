@@ -107,7 +107,7 @@ describe("resolveAgyBinary & missing binary handling", () => {
 
 describe("SessionBridgeManager native ACP tool results", () => {
   async function streamToolUpdates(updates: readonly AcpSessionUpdate[]) {
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: ({ onUpdate }) => ({
         isClosed: false,
         initialize: async () => ({}),
@@ -312,7 +312,7 @@ describe("Antigravity tool display (shapes recorded from agy 1.5.14)", () => {
   })
 
   test("streams the readable tool call and result through doStream", async () => {
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: ({ onUpdate }) =>
         ({
           isClosed: false,
@@ -401,7 +401,7 @@ describe("Antigravity native choice questions and prompt outcomes", () => {
   })
 
   test("counts agy's cached tokens into the input total", async () => {
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () =>
         ({
           isClosed: false,
@@ -440,7 +440,7 @@ describe("Antigravity native choice questions and prompt outcomes", () => {
 
   test("a refusal stop reason trips only that model pool's cooldown", async () => {
     resetSharedCatalogForTests()
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () =>
         ({
           isClosed: false,
@@ -607,11 +607,11 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
       return liveModels
     }
 
-    const b1 = new SessionBridgeManager(ctx, "/tmp/w1", undefined, {
+    const b1 = new SessionBridgeManager(ctx, "/tmp/w1", {
       onCatalogChanged: () => reloadNotifications++,
       discoverModels,
     })
-    const b2 = new SessionBridgeManager(ctx, "/tmp/w2", undefined, {
+    const b2 = new SessionBridgeManager(ctx, "/tmp/w2", {
       onCatalogChanged: () => reloadNotifications++,
       discoverModels,
     })
@@ -634,7 +634,7 @@ describe("SessionBridgeManager lifecycle & cached discovery", () => {
     // Simulate fresh server restart where memory cache is cleared but storage persists
     resetSharedCatalogForTests()
     let warmDiscoverCalls = 0
-    const b3 = new SessionBridgeManager(ctx, "/tmp/w1", undefined, {
+    const b3 = new SessionBridgeManager(ctx, "/tmp/w1", {
       discoverModels: async () => {
         warmDiscoverCalls++
         return liveModels
@@ -850,7 +850,7 @@ describe("History sanitizer & single-provider sessions", () => {
 
   test("the bridge spawns agy with its own sign-in method", async () => {
     const seen: any[] = []
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       auth: { method: "gemini-api-key", apiKey: "k" },
       createProc: (opts) => {
         seen.push(opts.auth)
@@ -1090,7 +1090,7 @@ describe("History sanitizer & single-provider sessions", () => {
       factoryCalls.push(fake)
       return fake
     }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeFakeProc(),
     })
     const s = (bridge as any).getOrCreateSession("fan-sess")
@@ -1156,7 +1156,7 @@ describe("History sanitizer & single-provider sessions", () => {
       factoryCalls.push(fake)
       return fake
     }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeFakeProc(),
     })
 
@@ -1213,7 +1213,7 @@ describe("History sanitizer & single-provider sessions", () => {
       factoryCalls.push(fake)
       return fake
     }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeFakeProc(),
     })
 
@@ -1250,7 +1250,7 @@ describe("History sanitizer & single-provider sessions", () => {
 
   test("warmSession stays quiet during circuit-breaker cooldown", async () => {
     let spawns = 0
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => {
         spawns++
         throw new Error("must not spawn during cooldown")
@@ -1299,7 +1299,7 @@ describe("History sanitizer & single-provider sessions", () => {
       factoryCalls.push(fake)
       return fake
     }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeFakeProc(),
     })
 
@@ -1377,7 +1377,7 @@ describe("History sanitizer & single-provider sessions", () => {
       factoryCalls.push(fake)
       return fake
     }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeFakeProc(),
     })
 
@@ -1472,7 +1472,7 @@ describe("History sanitizer & single-provider sessions", () => {
       factoryCalls.push(fake)
       return fake
     }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeFakeProc(),
     })
 
@@ -1620,7 +1620,7 @@ describe("Session start races, resume and settling prompts", () => {
 
     const factoryCalls: any[] = []
     let openInit!: () => void
-    const bridge = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
       createProc: () => {
         const callIndex = factoryCalls.length
         const state = { disposed: false, closed: false }
@@ -1702,7 +1702,7 @@ describe("Session start races, resume and settling prompts", () => {
       }) as any
     }) as any
     let spawns = 0
-    const bridge = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
       createProc: (() => {
         spawns++
         throw new Error("must not spawn during cooldown")
@@ -1724,7 +1724,7 @@ describe("Session start races, resume and settling prompts", () => {
 
   test("idle warmed sessions are LRU-capped; active turns are never evicted", async () => {
     const factoryCalls: any[] = []
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => {
         const fake = makeIdleFakeProc()
         factoryCalls.push(fake)
@@ -1761,7 +1761,7 @@ describe("Session start races, resume and settling prompts", () => {
     const SESSION_ID = "ses-resume-warm"
     const ctx = makeMockCtx({ [`antigravity-acp:session:${SESSION_ID}`]: "acp-stale" })
     let captured: any[] | undefined
-    const bridge = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
       createProc: () => {
         const fake = makeIdleFakeProc((prompt) => {
           captured = prompt
@@ -1804,7 +1804,7 @@ describe("Session start races, resume and settling prompts", () => {
 
     // Control: resume succeeds, so there is no flag.
     const ctx2 = makeMockCtx({ "antigravity-acp:session:ses-resume-ok": "acp-live" })
-    const bridge2 = new SessionBridgeManager(ctx2, "/tmp/acp-test-dir", undefined, {
+    const bridge2 = new SessionBridgeManager(ctx2, "/tmp/acp-test-dir", {
       createProc: () => makeIdleFakeProc(() => Promise.resolve({ stopReason: "end_turn" })) as any,
     })
     await bridge2.warmSession("ses-resume-ok")
@@ -1853,7 +1853,7 @@ describe("Session start races, resume and settling prompts", () => {
     const order: string[] = []
     let resolveFirst!: (v: any) => void
     const factoryCalls: any[] = []
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => {
         const fake: any = {
           get isClosed() {
@@ -1921,7 +1921,7 @@ describe("Session start races, resume and settling prompts", () => {
   test("wedged prompt is torn down after the settle timeout so the next turn starts fresh", async () => {
     const factoryCalls: any[] = []
     let promptCalls = 0
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => {
         const state = { disposed: false, closed: false }
         const fake: any = {
@@ -2075,7 +2075,7 @@ describe("Inline file data, LRU eviction and local notices", () => {
 
   test("LRU eviction preserves persisted acpSessionId in storage", async () => {
     const factoryCalls: any[] = []
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => {
         const idx = factoryCalls.length
         const state = { disposed: false, closed: false }
@@ -2124,7 +2124,7 @@ describe("Inline file data, LRU eviction and local notices", () => {
 
   test("foreground reservation protects against LRU eviction during setModel", async () => {
     const factoryCalls: any[] = []
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => {
         const idx = factoryCalls.length
         const state = { disposed: false, closed: false }
@@ -2271,7 +2271,7 @@ describe("Attachment decoding, cooldown rechecks and warm restarts", () => {
       }
       return fake
     }
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeProc() as any,
     })
     const sid = "ses-recheck-1"
@@ -2351,7 +2351,7 @@ describe("Attachment decoding, cooldown rechecks and warm restarts", () => {
       return fake
     }
     let n = 0
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: () => makeProc(n++),
     })
     bridgeRef = bridge
@@ -2404,7 +2404,7 @@ describe("Attachment decoding, cooldown rechecks and warm restarts", () => {
         return false
       },
     })
-    const bridge1 = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
+    const bridge1 = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
       createProc: () => failingResume() as any,
     })
     await bridge1.warmSession(SESSION_ID)
@@ -2417,7 +2417,7 @@ describe("Attachment decoding, cooldown rechecks and warm restarts", () => {
     // Simulated restart: the first real turn retries the prior id, fails to
     // resume again, and still tells the user, sending only the latest prompt.
     let captured: any[] | undefined
-    const bridge2 = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", undefined, {
+    const bridge2 = new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
       createProc: () => {
         const base: any = failingResume()
         const origPrompt = base.prompt
@@ -2457,7 +2457,7 @@ describe("Token/context window usage reporting", () => {
 
   function makeUsageBridge(promptImpl: (onUpdate: any) => (sid: string, prompt: any[]) => Promise<any>) {
     let onUpdateRef: any
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: ({ onUpdate }) => {
         onUpdateRef = onUpdate
         return {
@@ -2715,7 +2715,7 @@ describe("Antigravity questions via OpenCode's question tool", () => {
     const responses: any[] = []
     let releasePrompt!: () => void
     const promptDone = new Promise<void>((r) => (releasePrompt = r))
-    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", undefined, {
+    const bridge = new SessionBridgeManager(makeMockCtx(), "/tmp/acp-test-dir", {
       createProc: ({ onUpdate, onElicitation }) =>
         ({
           isClosed: false,

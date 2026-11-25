@@ -32,14 +32,14 @@ import {
   type AcpSessionUpdate,
 } from "./acp-client.js"
 import {
-  ACP_PROVIDER_ID,
   API_ERROR_ABORT_PATTERN,
   buildThinAcpPromptBlocks,
   extractToolResultsFromPrompt,
   hasNonAcpAssistantHistory,
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
-import { MAIN_ACCOUNT_ID, accountProviderID } from "./account-ids.js"
+import { MAIN_ACCOUNT_ID, accountProviderID, isAntigravityProvider } from "./account-ids.js"
+import type { AcpMode, AcpSessionState } from "./rpc.js"
 import {
   buildKeptConversation,
   historyDiverged,
@@ -60,7 +60,6 @@ import {
 /** OpenCode's built-in tool that asks the user questions. */
 const OPENCODE_QUESTION_TOOL = "question"
 
-export type AcpMode = "auto" | "accept-edits" | "default" | "plan"
 
 const ACP_MODES = new Set<AcpMode>(["auto", "accept-edits", "default", "plan"])
 
@@ -84,31 +83,22 @@ class StaleAcpStartError extends Error {
 }
 
 /** What the bridge keeps from OpenCode's request context: never sent to agy. */
-export interface SessionContextSnapshot {
+interface SessionContextSnapshot {
   readonly agent: string
   /** OpenCode's question tool is available to show agy's questions to the user. */
   readonly hasQuestionTool: boolean
 }
 
-export interface SessionPublicState {
-  readonly sessionID: string
-  readonly mode: AcpMode
-  /** The selected sign-in method's label, such as "Google account". */
-  readonly authMethod: string
-  readonly starting: boolean
-  readonly acpSessionId: string | null
-  readonly connected: boolean
-  readonly busy: boolean
-  readonly modelCount: number
-  readonly lastError: string | null
-  readonly cooldownUntil: number | null
-  /** The account's name; "Main" for your normal agy login. */
-  readonly account: string
-}
+type SessionPublicState = AcpSessionState
 
-/** Shown when a session already holds turns from another model or another Antigravity account. */
+/** Shown when a session already holds turns from a model outside Antigravity. */
 export const FOREIGN_HISTORY_MESSAGE =
-  "This session already has replies from another model or another Antigravity account. Antigravity only continues its own conversations, and each session stays on one account, so it won't read them. Start a new session to use this model."
+  "This session already has replies from another model. Antigravity only continues its own conversations, so it won't read them. Start a new session to use Antigravity."
+
+/** Shown when you move a session to another Antigravity account. */
+export function accountSwitchNotice(accountName: string): string {
+  return `Switched this session to the Antigravity account "${accountName}". Antigravity started a new conversation there and was given the conversation so far.\n\n`
+}
 
 /** Permission metadata key holding agy's warning for an "Allow always" choice. */
 export const ANTIGRAVITY_WARNING_METADATA_KEY = "antigravityWarning"
@@ -149,7 +139,6 @@ interface PendingQuestion {
   emittedToOpenCode: boolean
   resolved: boolean
   readonly resolve: (res: ToolResultForAgy) => void
-  abortCleanup?: () => void
   /** agy's own pending ask_question call, closed when the question is shown. */
   readonly nativeToolCallId?: string
   /**
@@ -187,7 +176,6 @@ interface BridgeSession {
   acpSessionId?: string
   proc?: AcpProcess
   lastModelId?: string
-  lastModeApplied?: AcpMode
   lastError: string | null
   lastTitleSent?: string
   contextSnapshot?: SessionContextSnapshot
@@ -244,19 +232,20 @@ function storageKeys(accountId: string) {
     session: `${scope}:session:`,
     turns: `${scope}:turns:`,
     cooldown: `${scope}:cooldown`,
+    catalog: `${scope}:model-catalog:v1`,
   }
 }
-const MODEL_CATALOG_STORAGE_KEY = "antigravity-acp:model-catalog:v1"
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000
 
 /**
  * Upper bound on idle pre-warmed sessions. Clicking across many sessions must
- * not accumulate unbounded `agy acp` children; the LRU victim is torn down via
- * resetSession (never a session with an active turn or an in-flight start).
+ * not accumulate unbounded `agy acp` children; the LRU victim's process is
+ * stopped but its stored agy session ID is kept, so it resumes later (never a
+ * session with an active turn or an in-flight start).
  */
 const MAX_IDLE_WARMED_SESSIONS = 2
 
-export type QuotaBucket = "claude-gpt" | "gemini" | "other"
+type QuotaBucket = "claude-gpt" | "gemini" | "other"
 
 type CooldownBucket = QuotaBucket | "global"
 
@@ -288,14 +277,17 @@ function isGlobalBreakerError(message: string): boolean {
   return /\(code 403\)|PERMISSION_DENIED/i.test(message)
 }
 
-let sharedCatalog: readonly AcpDiscoveredModel[] | undefined
-let sharedCatalogUpdatedAt = 0
-let sharedDiscoveryPromise: Promise<readonly AcpDiscoveredModel[]> | undefined
+/**
+ * Each account's model list, shared by every bridge of that account (one per
+ * project folder). Google allows different models per account, so an account
+ * lists only what its own agy offers.
+ */
+const catalogs = new Map<string, { models: readonly AcpDiscoveredModel[]; updatedAt: number }>()
+const discoveries = new Map<string, Promise<readonly AcpDiscoveredModel[]>>()
 
 export function resetSharedCatalogForTests(): void {
-  sharedCatalog = undefined
-  sharedCatalogUpdatedAt = 0
-  sharedDiscoveryPromise = undefined
+  catalogs.clear()
+  discoveries.clear()
 }
 
 function isValidCatalog(raw: unknown): raw is readonly AcpDiscoveredModel[] {
@@ -402,7 +394,7 @@ function buildUsage(
 }
 
 /** The account a bridge runs as: your normal agy login, or an extra account's folder. */
-export interface BridgeAccount {
+interface BridgeAccount {
   readonly id: string
   readonly name: string
   /** The extra account's private folder; absent for the main account. */
@@ -420,9 +412,10 @@ export class SessionBridgeManager {
   /** Marks a reply as Antigravity's. */
   private readonly acpMarker: Record<string, { acp: true }>
   private sessions = new Map<string, BridgeSession>()
-  private catalog: readonly AcpDiscoveredModel[] = FALLBACK_MODELS
-  private onStateChanged?: (sessionID: string) => void
+  /** Until its own list is read, the main account shows the built-in list and an extra account none. */
+  private catalog: readonly AcpDiscoveredModel[]
   private onCatalogChanged?: () => void
+  private onSessionMoved?: (sessionID: string) => Promise<void>
   private discoverModelsFn: (cwd: string) => Promise<readonly AcpDiscoveredModel[]>
   private createProcFn: (options: AcpProcessOptions) => AcpProcess
   private cooldownsByBucket = new Map<CooldownBucket, { until: number; reason: string }>()
@@ -444,7 +437,6 @@ export class SessionBridgeManager {
   constructor(
     private readonly ctx: Plugin.Context,
     private readonly defaultCwd: string,
-    onStateChanged?: (sessionID: string) => void,
     options?: {
       readonly onCatalogChanged?: () => void
       readonly discoverModels?: (cwd: string) => Promise<readonly AcpDiscoveredModel[]>
@@ -456,6 +448,8 @@ export class SessionBridgeManager {
       readonly attachmentsDir?: string
       /** The account this bridge runs as; your normal agy login when omitted. */
       readonly account?: BridgeAccount
+      /** A session moved to this account: other accounts release it. */
+      readonly onSessionMoved?: (sessionID: string) => Promise<void>
     },
   ) {
     this.auth = options?.auth ?? { method: "oauth-personal" }
@@ -465,8 +459,9 @@ export class SessionBridgeManager {
     // OpenCode stores a reply's metadata only under its provider's key.
     this.acpMarker = { [this.providerID]: { acp: true } }
     this.attachmentsDir = options?.attachmentsDir ?? defaultAttachmentsDir(this.account.id)
-    this.onStateChanged = onStateChanged
+    this.catalog = catalogs.get(this.account.id)?.models ?? (this.account.home ? [] : FALLBACK_MODELS)
     this.onCatalogChanged = options?.onCatalogChanged
+    this.onSessionMoved = options?.onSessionMoved
     this.discoverModelsFn =
       options?.discoverModels ??
       ((cwd) => discoverAcpModels(cwd, { auth: this.auth, accountHome: this.account.home }))
@@ -482,14 +477,16 @@ export class SessionBridgeManager {
         extraDirs: [...(opts.extraDirs ?? []), this.attachmentsDir],
       })
     }
-    if (sharedCatalog && sharedCatalog.length > 0) {
-      this.catalog = sharedCatalog
-    }
   }
 
-  /** Every account lists the same models: the latest catalog any account read. */
+  /** The models this account may use. */
   getModels(): readonly AcpDiscoveredModel[] {
-    return sharedCatalog && sharedCatalog.length > 0 ? sharedCatalog : this.catalog
+    return catalogs.get(this.account.id)?.models ?? this.catalog
+  }
+
+  private setCatalog(models: readonly AcpDiscoveredModel[], updatedAt: number): void {
+    catalogs.set(this.account.id, { models, updatedAt })
+    this.catalog = models
   }
 
   /** Stores a PDF for agy under this session's attachment folder; returns its file URI. */
@@ -515,26 +512,25 @@ export class SessionBridgeManager {
   }
 
   async loadCachedModels(): Promise<{ readonly stale: boolean; readonly changed: boolean }> {
-    if (sharedCatalog && sharedCatalog.length > 0) {
+    const known = catalogs.get(this.account.id)
+    if (known) {
       const prevSig = catalogSignature(this.catalog)
-      this.catalog = sharedCatalog
+      this.catalog = known.models
       return {
-        stale: Date.now() - sharedCatalogUpdatedAt > MODEL_CATALOG_TTL_MS,
-        changed: prevSig !== catalogSignature(sharedCatalog),
+        stale: Date.now() - known.updatedAt > MODEL_CATALOG_TTL_MS,
+        changed: prevSig !== catalogSignature(known.models),
       }
     }
 
     try {
-      const raw = (await Effect.runPromise(
-        this.ctx.storage.get(MODEL_CATALOG_STORAGE_KEY),
-      )) as { readonly updatedAt?: unknown; readonly models?: unknown } | undefined
+      const raw = (await Effect.runPromise(this.ctx.storage.get(this.keys.catalog))) as
+        | { readonly updatedAt?: unknown; readonly models?: unknown }
+        | undefined
       if (raw && typeof raw === "object" && isValidCatalog(raw.models)) {
         const normalized = normalizeCatalog(raw.models)
         const updatedAt = typeof raw.updatedAt === "number" ? raw.updatedAt : 0
         const prevSig = catalogSignature(this.catalog)
-        sharedCatalog = normalized
-        sharedCatalogUpdatedAt = updatedAt
-        this.catalog = normalized
+        this.setCatalog(normalized, updatedAt)
         return {
           stale: Date.now() - updatedAt > MODEL_CATALOG_TTL_MS,
           changed: prevSig !== catalogSignature(normalized),
@@ -551,7 +547,7 @@ export class SessionBridgeManager {
   ): Promise<void> {
     try {
       await Effect.runPromise(
-        this.ctx.storage.set(MODEL_CATALOG_STORAGE_KEY, {
+        this.ctx.storage.set(this.keys.catalog, {
           version: 1,
           updatedAt,
           models: models as unknown as any,
@@ -563,34 +559,30 @@ export class SessionBridgeManager {
   async refreshModels(options?: {
     readonly force?: boolean
   }): Promise<{ readonly models: readonly AcpDiscoveredModel[]; readonly changed: boolean }> {
-    if (
-      !options?.force &&
-      sharedCatalog &&
-      sharedCatalog.length > 0 &&
-      Date.now() - sharedCatalogUpdatedAt <= MODEL_CATALOG_TTL_MS
-    ) {
-      const changed = catalogSignature(this.catalog) !== catalogSignature(sharedCatalog)
-      this.catalog = sharedCatalog
+    const known = catalogs.get(this.account.id)
+    if (!options?.force && known && Date.now() - known.updatedAt <= MODEL_CATALOG_TTL_MS) {
+      const changed = catalogSignature(this.catalog) !== catalogSignature(known.models)
+      this.catalog = known.models
       return { models: this.catalog, changed }
     }
 
-    if (!sharedDiscoveryPromise) {
-      sharedDiscoveryPromise = (async () => {
-        const discovered = await this.discoverModelsFn(this.defaultCwd)
-        const normalized = normalizeCatalog(discovered)
+    let discovery = discoveries.get(this.account.id)
+    if (!discovery) {
+      discovery = (async () => {
+        const normalized = normalizeCatalog(await this.discoverModelsFn(this.defaultCwd))
         if (normalized.length > 0) {
           const updatedAt = Date.now()
-          sharedCatalog = normalized
-          sharedCatalogUpdatedAt = updatedAt
+          catalogs.set(this.account.id, { models: normalized, updatedAt })
           await this.persistCatalog(normalized, updatedAt)
         }
         return normalized
       })().finally(() => {
-        sharedDiscoveryPromise = undefined
+        discoveries.delete(this.account.id)
       })
+      discoveries.set(this.account.id, discovery)
     }
 
-    const normalized = await sharedDiscoveryPromise
+    const normalized = await discovery
     if (normalized.length === 0) {
       return { models: this.catalog, changed: false }
     }
@@ -770,7 +762,6 @@ export class SessionBridgeManager {
       const holder: { owner?: BridgeSession } = {}
       const proc = this.createProcFn({
         cwd: this.defaultCwd,
-        dangerouslySkipPermissions: false,
         onUpdate: (_sid, update) => {
           if (holder.owner) this.handleAcpUpdate(holder.owner, update)
         },
@@ -872,6 +863,30 @@ export class SessionBridgeManager {
     if (idx !== -1) this.warmedIdleSessions.splice(idx, 1)
   }
 
+  /**
+   * Which providers replied in this session, from OpenCode's stored messages.
+   * OpenCode hands a reply's metadata only to the provider that wrote it, so
+   * this is the only way to tell another Antigravity account's replies from
+   * another model's. Unknown when the history cannot be read.
+   */
+  private async replyProviders(sessionID: string): Promise<string[] | undefined> {
+    try {
+      const messages = (await Effect.runPromise(
+        (this.ctx.session as any).context({ sessionID }),
+      )) as ReadonlyArray<{
+        readonly type?: string
+        readonly model?: { readonly providerID?: string }
+        readonly time?: { readonly completed?: number }
+      }>
+      // The reply being written is already stored; only finished ones count.
+      return messages
+        .filter((m) => m?.type === "assistant" && typeof m.model?.providerID === "string" && m.time?.completed)
+        .map((m) => m.model!.providerID!)
+    } catch {
+      return undefined
+    }
+  }
+
   /** For an extra account agy cannot use yet: how to sign it in. */
   signInRequiredMessage(err: unknown): string | undefined {
     if (!this.account.home) return undefined
@@ -903,12 +918,10 @@ export class SessionBridgeManager {
     if (s.proc && !s.proc.isClosed && s.acpSessionId) {
       try {
         await s.proc.setMode(s.acpSessionId, mode)
-        s.lastModeApplied = mode
       } catch (err) {
         s.lastError = err instanceof Error ? err.message : String(err)
       }
     }
-    this.notifyChanged(sessionID)
     return this.getState(sessionID)
   }
 
@@ -958,7 +971,6 @@ export class SessionBridgeManager {
         }
         s.acpSessionId = undefined
         s.lastModelId = undefined
-        s.lastModeApplied = undefined
         s.lastError = null
         s.pendingResumeLost = undefined
         s.settlingPrompt = undefined
@@ -971,7 +983,6 @@ export class SessionBridgeManager {
         releaseReset()
       }
     }
-    this.notifyChanged(sessionID)
     return this.getState(sessionID)
   }
 
@@ -981,7 +992,6 @@ export class SessionBridgeManager {
     if (s && !s.activeTurn && !s.startLock) {
       this.sessions.delete(sessionID)
     }
-    this.notifyChanged(sessionID)
   }
 
   async handleInterrupt(sessionID: string, reason = "Cancelled"): Promise<void> {
@@ -999,19 +1009,10 @@ export class SessionBridgeManager {
     for (const call of turn.pendingQuestions.values()) {
       if (!call.resolved) {
         call.resolved = true
-        try {
-          call.abortCleanup?.()
-        } catch {}
-        call.abortCleanup = undefined
         call.resolve({
           content: [{ type: "text", text: reason }],
           isError: true,
         })
-      } else {
-        try {
-          call.abortCleanup?.()
-        } catch {}
-        call.abortCleanup = undefined
       }
     }
     turn.pendingQuestions.clear()
@@ -1024,7 +1025,6 @@ export class SessionBridgeManager {
     }
     this.finishControllerWithError(turn, new Error(reason))
     s.activeTurn = undefined
-    this.notifyChanged(sessionID)
   }
 
   private finishTurnCleanStop(
@@ -1041,19 +1041,10 @@ export class SessionBridgeManager {
     for (const call of turn.pendingQuestions.values()) {
       if (!call.resolved) {
         call.resolved = true
-        try {
-          call.abortCleanup?.()
-        } catch {}
-        call.abortCleanup = undefined
         call.resolve({
           content: [{ type: "text", text }],
           isError: true,
         })
-      } else {
-        try {
-          call.abortCleanup?.()
-        } catch {}
-        call.abortCleanup = undefined
       }
     }
     turn.pendingQuestions.clear()
@@ -1163,11 +1154,6 @@ export class SessionBridgeManager {
     this.warmedIdleSessions.length = 0
   }
 
-  private notifyChanged(sessionID: string): void {
-    try {
-      this.onStateChanged?.(sessionID)
-    } catch {}
-  }
 
   private async runStorageGet(sessionID: string): Promise<string | undefined> {
     try {
@@ -1295,7 +1281,6 @@ export class SessionBridgeManager {
       } else {
         proc = this.createProcFn({
           cwd: s.cwd,
-          dangerouslySkipPermissions: false,
           onUpdate: (_sid, update) => this.handleAcpUpdate(s, update),
           onPermissionRequest: (params) => this.handlePermissionRequest(s, params),
           onElicitation: (params) => this.handleElicitation(s, params),
@@ -1344,7 +1329,7 @@ export class SessionBridgeManager {
         }
 
         if (this.disposed) throw new PluginDisposedError()
-        // Mode flipped (or session reset) while this start was in flight:
+        // The session was reset while this start was in flight:
         // let the catch block dispose the stale proc without installing it.
         throwIfStale()
         if (s.proc && !s.proc.isClosed && s.acpSessionId) {
@@ -1376,9 +1361,7 @@ export class SessionBridgeManager {
           const live = normalizeCatalog(buildModelCatalog(res))
           if (live.length > 0 && catalogSignature(live) !== catalogSignature(this.catalog)) {
             const updatedAt = Date.now()
-            this.catalog = live
-            sharedCatalog = live
-            sharedCatalogUpdatedAt = updatedAt
+            this.setCatalog(live, updatedAt)
             void this.persistCatalog(live, updatedAt)
             if (!this.disposed) {
               this.onCatalogChanged?.()
@@ -1388,7 +1371,6 @@ export class SessionBridgeManager {
 
         if (s.mode !== "default") {
           await proc.setMode(s.acpSessionId, s.mode).catch(() => {})
-          s.lastModeApplied = s.mode
         }
         if (this.disposed) throw new PluginDisposedError()
       } catch (err) {
@@ -1426,13 +1408,11 @@ export class SessionBridgeManager {
     const winner = adoption.winner
     if (winner) {
       if (this.disposed) throw new PluginDisposedError()
-      this.notifyChanged(s.sessionID)
       return { proc: winner.proc, acpSessionId: winner.acpSessionId, resumeLost: false }
     }
     if (this.disposed || !s.proc || !s.acpSessionId) {
       throw new PluginDisposedError()
     }
-    this.notifyChanged(s.sessionID)
     return { proc: s.proc, acpSessionId: s.acpSessionId, resumeLost: resumeFailed }
   }
 
@@ -1457,7 +1437,6 @@ export class SessionBridgeManager {
     s.lastError = `agy acp exited (code=${code}, signal=${signal})${tail ? `: ${tail.split("\n").at(-1)}` : ""}`
     s.acpSessionId = undefined
     s.lastModelId = undefined
-    s.lastModeApplied = undefined
     s.settlingPrompt = undefined
     s.pendingResumeLost = undefined
     if (s.activeTurn) {
@@ -1473,16 +1452,7 @@ export class SessionBridgeManager {
       for (const c of turn.pendingQuestions.values()) {
         if (!c.resolved) {
           c.resolved = true
-          try {
-            c.abortCleanup?.()
-          } catch {}
-          c.abortCleanup = undefined
           c.resolve({ content: [{ type: "text", text: "ACP process exited" }], isError: true })
-        } else {
-          try {
-            c.abortCleanup?.()
-          } catch {}
-          c.abortCleanup = undefined
         }
       }
       turn.pendingQuestions.clear()
@@ -1491,7 +1461,6 @@ export class SessionBridgeManager {
       s.activeTurn = undefined
     }
     if (s.proc === proc) s.proc = undefined
-    this.notifyChanged(s.sessionID)
   }
 
   private async handlePermissionRequest(
@@ -1878,8 +1847,6 @@ export class SessionBridgeManager {
       const modeId = String(update.currentModeId ?? "")
       if (ACP_MODES.has(modeId as AcpMode) && s.mode !== modeId) {
         s.mode = modeId as AcpMode
-        s.lastModeApplied = s.mode
-        this.notifyChanged(s.sessionID)
       }
       return
     }
@@ -1939,7 +1906,6 @@ export class SessionBridgeManager {
           s.proc = undefined
           s.acpSessionId = undefined
           s.lastModelId = undefined
-          s.lastModeApplied = undefined
           s.settlingPrompt = undefined
           if (proc) {
             this.intentionallyDisposed.add(proc)
@@ -1974,7 +1940,6 @@ export class SessionBridgeManager {
             "quota_cooldown",
           )
         }
-        this.notifyChanged(s.sessionID)
         return
       }
 
@@ -2111,19 +2076,10 @@ export class SessionBridgeManager {
     for (const call of turn.pendingQuestions.values()) {
       if (!call.resolved) {
         call.resolved = true
-        try {
-          call.abortCleanup?.()
-        } catch {}
-        call.abortCleanup = undefined
         call.resolve({
           content: [{ type: "text", text: "Turn ended before OpenCode tool dispatch." }],
           isError: true,
         })
-      } else {
-        try {
-          call.abortCleanup?.()
-        } catch {}
-        call.abortCleanup = undefined
       }
     }
     turn.pendingQuestions.clear()
@@ -2150,7 +2106,6 @@ export class SessionBridgeManager {
     if (s.activeTurn === turn) {
       s.activeTurn = undefined
     }
-    this.notifyChanged(s.sessionID)
   }
 
   private createImmediateTextStream(
@@ -2273,10 +2228,6 @@ export class SessionBridgeManager {
                 existingTurn.pendingQuestions.delete(callId)
                 if (!pending.resolved) {
                   pending.resolved = true
-                  try {
-                    pending.abortCleanup?.()
-                  } catch {}
-                  pending.abortCleanup = undefined
                   const res = matchedResults.get(callId) ?? {
                     text: "Tool result missing for " + callId,
                     isError: true,
@@ -2285,11 +2236,6 @@ export class SessionBridgeManager {
                     content: [{ type: "text", text: res.text }],
                     isError: res.isError,
                   })
-                } else {
-                  try {
-                    pending.abortCleanup?.()
-                  } catch {}
-                  pending.abortCleanup = undefined
                 }
               }
 
@@ -2315,16 +2261,26 @@ export class SessionBridgeManager {
 
         // T3 Code keeps a thread on one provider. A session that already has
         // replies from another model stays there: Antigravity is never handed
-        // that model's conversation.
+        // that model's conversation. Replies from another Antigravity account
+        // look the same in the prompt; those you may move between, by picking
+        // the other account's model (never automatically).
+        let switchedAccount = false
         if (hasNonAcpAssistantHistory(options.prompt)) {
-          return {
-            stream: bridge.createImmediateTextStream(FOREIGN_HISTORY_MESSAGE, "foreign_history"),
+          const providers = await bridge.replyProviders(sessionID)
+          if (!providers || providers.length === 0 || !providers.every(isAntigravityProvider)) {
+            return {
+              stream: bridge.createImmediateTextStream(FOREIGN_HISTORY_MESSAGE, "foreign_history"),
+            }
           }
+          switchedAccount = providers[providers.length - 1] !== bridge.providerID
         }
 
         let target: ReturnType<typeof resolveAcpModelTarget>
         try {
-          target = resolveAcpModelTarget(bridge.getModels(), modelID, variant)
+          // An account whose list is not read yet checks the model against
+          // the built-in list; agy itself refuses a model the account lacks.
+          const models = bridge.getModels()
+          target = resolveAcpModelTarget(models.length > 0 ? models : FALLBACK_MODELS, modelID, variant)
         } catch (err) {
           if (!(err instanceof UnavailableModelError)) throw err
           return { stream: bridge.createImmediateTextStream(err.message, "model_unavailable") }
@@ -2404,7 +2360,6 @@ export class SessionBridgeManager {
               // Drop cached model/mode targets so the replacement proc below
               // is (re)configured instead of inheriting the wedged state.
               s.lastModelId = undefined
-              s.lastModeApplied = undefined
               s.lastError =
                 "Previous Antigravity prompt did not settle in time; started a fresh session."
               // Await the removal so the replacement session below never
@@ -2445,7 +2400,14 @@ export class SessionBridgeManager {
         const turnHistory = readTurnHistory(options.prompt)
         const delivered = await bridge.loadDeliveredTurns(sessionID)
         let rewound = false
-        if (delivered && historyDiverged(delivered, turnHistory)) {
+        if (switchedAccount) {
+          // This account's agy has not seen the other account's replies: it
+          // starts a new conversation and gets the one so far. The account
+          // the session left stops its process for this session.
+          bridge.diag(s, "account switch: the latest reply came from another account; starting fresh")
+          await bridge.resetSession(sessionID)
+          await bridge.onSessionMoved?.(sessionID).catch(() => {})
+        } else if (delivered && historyDiverged(delivered, turnHistory)) {
           const currentAcpId = s.acpSessionId ?? (await bridge.runStorageGet(sessionID))
           if (currentAcpId === delivered.acpSessionId) {
             bridge.diag(s, "rewind: OpenCode history diverged from agy session; starting fresh")
@@ -2469,7 +2431,6 @@ export class SessionBridgeManager {
           if (err instanceof AgyNotFoundError || (err as NodeJS.ErrnoException)?.code === "ENOENT") {
             const msg = err instanceof Error ? err.message : String(err)
             s.lastError = msg
-            bridge.notifyChanged(sessionID)
             return {
               stream: bridge.createImmediateTextStream(msg, "agy_unavailable"),
             }
@@ -2477,7 +2438,6 @@ export class SessionBridgeManager {
           const signIn = bridge.signInRequiredMessage(err)
           if (signIn) {
             s.lastError = signIn
-            bridge.notifyChanged(sessionID)
             return { stream: bridge.createImmediateTextStream(signIn, "sign_in_required") }
           }
           throw err
@@ -2513,7 +2473,6 @@ export class SessionBridgeManager {
         } catch (err) {
           if (!(err instanceof UnavailableModelError)) throw err
           s.lastError = err.message
-          bridge.notifyChanged(sessionID)
           return { stream: bridge.createImmediateTextStream(err.message, "model_unavailable") }
         }
 
@@ -2541,7 +2500,8 @@ export class SessionBridgeManager {
         }
 
         // Like T3 Code, only the user's latest message and its attachments go
-        // to agy: agy owns its session history, nothing earlier is replayed.
+        // to agy: agy owns its session history, nothing earlier is replayed
+        // (after a rewind, the kept conversation is prepended once).
         // When resume failed, the new agy session has no history; the user is
         // told once instead of the conversation being sent again.
         // pendingResumeLost covers the warm path, where the replacement
@@ -2557,7 +2517,14 @@ export class SessionBridgeManager {
         const promptBlocks = buildThinAcpPromptBlocks(options.prompt, {
           storeAttachment: (file) => bridge.storeAttachment(sessionID, file),
         })
-        const keptConversation = rewound ? buildKeptConversation(options.prompt) : undefined
+        const keptConversation = switchedAccount
+          ? buildKeptConversation(
+              options.prompt,
+              "This conversation moved here from another Antigravity account, so it continues in a new session.",
+            )
+          : rewound
+            ? buildKeptConversation(options.prompt)
+            : undefined
         if (keptConversation) promptBlocks.unshift({ type: "text", text: keptConversation })
         const deliveredRecord = recordDelivery(turnHistory, acpSessionId)
 
@@ -2572,10 +2539,10 @@ export class SessionBridgeManager {
         }
         s.lastContextUsed = undefined
         s.activeTurn = turn
-        bridge.notifyChanged(sessionID)
 
         const stream = bridge.createBoundStream(s, turn, options.abortSignal, () => {
-          if (rewound) bridge.emitLocalNotice(turn, REWIND_NOTICE)
+          if (switchedAccount) bridge.emitLocalNotice(turn, accountSwitchNotice(bridge.account.name))
+          else if (rewound) bridge.emitLocalNotice(turn, REWIND_NOTICE)
           else if (showResumeLost) bridge.emitLocalNotice(turn, RESUME_LOST_NOTICE)
           const pending = proc.prompt(acpSessionId, promptBlocks)
           if (deliveredRecord) void bridge.saveDeliveredTurns(sessionID, deliveredRecord)
@@ -2609,7 +2576,6 @@ export class SessionBridgeManager {
                   `Antigravity ACP stopped this turn: the ${bucket} model quota is exhausted (60s cooldown for this model pool; other pools are unaffected, switch models to continue).`,
                   "quota_cooldown",
                 )
-                bridge.notifyChanged(sessionID)
                 return
               }
               s.lastError = null
@@ -2617,7 +2583,7 @@ export class SessionBridgeManager {
                 clearTimeout(turn.flushTimer)
                 turn.flushTimer = undefined
               }
-              // Wait if any OpenCode tool call is still mid-roundtrip (shouldn't happen before HTTP reply, unless aborted)
+              // Wait if any OpenCode tool call is still mid-roundtrip (shouldn't happen before agy answers the prompt, unless aborted)
               if (turn.dispatchedCallIds.size === 0 && turn.controller) {
                 bridge.finalizeTurnStop(s, turn)
               }
@@ -2642,7 +2608,6 @@ export class SessionBridgeManager {
                     s.acpSessionId = undefined
                   }
                   s.lastModelId = undefined
-                  s.lastModeApplied = undefined
                   s.settlingPrompt = undefined
                   proc.killImmediate()
                   bridge.finishTurnCleanStop(
@@ -2670,7 +2635,6 @@ export class SessionBridgeManager {
                     "quota_cooldown",
                   )
                 }
-                bridge.notifyChanged(sessionID)
                 return
               }
 
@@ -2681,16 +2645,7 @@ export class SessionBridgeManager {
               for (const c of turn.pendingQuestions.values()) {
                 if (!c.resolved) {
                   c.resolved = true
-                  try {
-                    c.abortCleanup?.()
-                  } catch {}
-                  c.abortCleanup = undefined
                   c.resolve({ content: [{ type: "text", text: error.message }], isError: true })
-                } else {
-                  try {
-                    c.abortCleanup?.()
-                  } catch {}
-                  c.abortCleanup = undefined
                 }
               }
               turn.pendingQuestions.clear()
@@ -2699,7 +2654,6 @@ export class SessionBridgeManager {
               s.lastError = error.message
               bridge.finishControllerWithError(turn, error)
               if (s.activeTurn === turn) s.activeTurn = undefined
-              bridge.notifyChanged(sessionID)
             })
         })
 
