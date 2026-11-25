@@ -1,6 +1,6 @@
 {
   "name": "@ishrakr/opencode-antigravity-acp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run Google Antigravity as the agent in OpenCode through the official agy acp protocol, as an ACP client like T3 Code and Zed.",
   "author": "system1970",
   "license": "MIT",
@@ -29,13 +29,15 @@
   "files": [
     "src",
     "dist",
+    "bin",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build:gui": "vite build",
     "test": "bun test ./test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:cli": "bun run scripts/build-cli.ts"
   },
   "peerDependencies": {
     "@opencode/plugin": "^2.3.2",
@@ -50,5 +52,8 @@
     "typescript": "^5.8.0",
     "vite": "^7.0.0",
     "vite-plugin-solid": "^2.11.0"
+  },
+  "bin": {
+    "agy-accounts": "./bin/agy-accounts.js"
   }
 }

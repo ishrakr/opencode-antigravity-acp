@@ -4,13 +4,15 @@ An OpenChamber extension that adds an **Antigravity** section to Work Status: th
 
 It shows both groups in every session. In a session that uses an Antigravity model, that session's group comes first and is marked "this session".
 
+With [separate accounts](../README.md#separate-accounts) it lists every account under its name: your normal login as "Main", then each account you added. The session's own account comes first and is marked "this session". An account that isn't signed in shows the command that signs it in. With only your normal login, the section looks as it always did.
+
 It adds no card to Settings → Usage, so Antigravity no longer appears in OpenChamber's general Usage section.
 
-Type `/agy-quota` in the chat box to see the same figures in a notification, wherever you are: both groups with what is left and when each refills, with a Copy button. It runs no model turn and attaches nothing to your message.
+Type `/agy-quota` in the chat box to see the same figures in a notification, wherever you are: each account's groups with what is left and when each refills, with a Copy button. When every account doesn't fit, refill times are left out. It runs no model turn and attaches nothing to your message.
 
-It reads the quota from the Antigravity CLI's own `/quota` command (`agy -p "/quota" --output-format json`), with your existing `agy` login. It reads no tokens, calls no Google endpoint itself, and runs no model turn. Each read starts `agy` once (about 2 seconds); a good reading is reused for a minute.
+It reads the quota from the Antigravity CLI's own `/quota` command (`agy -p "/quota" --output-format json`), with your existing `agy` login. It reads no tokens, calls no Google endpoint itself, and runs no model turn. Each read starts `agy` once per signed-in account (about 2 seconds and 240 MB each, at most three at a time); a good reading is reused for a minute.
 
-The plugin itself works like T3 Code, which doesn't show Antigravity's subscription quota. This extension is separate and optional: it runs `agy` headless from OpenChamber, which Google's FAQ describes as meant for direct scripting. Leave it out if you want only what T3 Code does. It reads the quota of the personal Google login only; with the API key or Agent Platform sign-in methods there is no Antigravity plan quota to show.
+The plugin itself works like T3 Code, which doesn't show Antigravity's subscription quota. This extension is separate and optional: it runs `agy` headless from OpenChamber, which Google's FAQ describes as meant for direct scripting. Leave it out if you want only what T3 Code does. It reads the quota of personal Google logins only; with the API key or Agent Platform sign-in methods there is no Antigravity plan quota to show.
 
 ## Install
 

@@ -3,9 +3,19 @@ import type {
   LanguageModelV3ToolResultOutput,
 } from "@ai-sdk/provider"
 import type { AcpContentBlock } from "./acp-client.js"
+import { MAIN_PROVIDER_ID, isAntigravityProvider } from "./account-ids.js"
 import { isAcpToolName } from "./tool-display.js"
 
-export const ACP_PROVIDER_ID = "antigravity-acp"
+export const ACP_PROVIDER_ID = MAIN_PROVIDER_ID
+
+/** The Antigravity entry of a metadata record, under any account's provider key. */
+function antigravityEntry(record: unknown): unknown {
+  if (!record || typeof record !== "object") return undefined
+  for (const [key, value] of Object.entries(record)) {
+    if (isAntigravityProvider(key)) return value
+  }
+  return undefined
+}
 
 export const API_ERROR_ABORT_PATTERN =
   /API error \(attempt \d+\)|RESOURCE_EXHAUSTED|Individual quota reached|\(code 429\)|\(code 403\)|PERMISSION_DENIED/i
@@ -77,7 +87,7 @@ export function sanitizeForNonAcpModel(messages: any[]): void {
         const isAcpHosted =
           (part.type === "tool-call" || part.type === "tool-result") &&
           part.providerExecuted === true &&
-          (Boolean(part.providerMetadata?.[ACP_PROVIDER_ID]) ||
+          (Boolean(antigravityEntry(part.providerMetadata)) ||
             isAcpToolName(part.name))
 
         if (isAcpHosted) {
@@ -247,16 +257,14 @@ function formatToolResultOutput(output: LanguageModelV3ToolResultOutput): {
 
 function hasAcpMarker(msg: LanguageModelV3Prompt[number]): boolean {
   if (msg.role !== "assistant") return false
-  const msgOpts = (msg as any).providerOptions
-  if (msgOpts && ACP_PROVIDER_ID in msgOpts) return true
-  const msgMeta = (msg as any).providerMetadata
-  if (msgMeta && ACP_PROVIDER_ID in msgMeta) return true
+  if (antigravityEntry((msg as any).providerOptions) !== undefined) return true
+  if (antigravityEntry((msg as any).providerMetadata) !== undefined) return true
   return (msg.content as any[]).some((part) => {
     if (!part || typeof part !== "object") return false
-    const partOpts = (part as any).providerOptions
-    if (partOpts && ACP_PROVIDER_ID in partOpts) return true
-    const partMeta = (part as any).providerMetadata
-    return !!(partMeta && ACP_PROVIDER_ID in partMeta)
+    return (
+      antigravityEntry((part as any).providerOptions) !== undefined ||
+      antigravityEntry((part as any).providerMetadata) !== undefined
+    )
   })
 }
 
@@ -543,7 +551,7 @@ export function hasNonAcpAssistantHistory(prompt: LanguageModelV3Prompt): boolea
 export function isLocalStatusMessage(msg: LanguageModelV3Prompt[number]): boolean {
   const check = (holder: any): boolean => {
     if (!holder || typeof holder !== "object") return false
-    const meta = holder.providerMetadata?.[ACP_PROVIDER_ID] ?? holder.providerOptions?.[ACP_PROVIDER_ID]
+    const meta = antigravityEntry(holder.providerMetadata) ?? antigravityEntry(holder.providerOptions)
     return !!meta && typeof meta === "object" && (meta as any).localStatus === true
   }
   if (check(msg)) return true

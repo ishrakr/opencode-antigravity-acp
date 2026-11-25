@@ -39,6 +39,7 @@ import {
   hasNonAcpAssistantHistory,
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
+import { MAIN_ACCOUNT_ID, accountProviderID } from "./account-ids.js"
 import {
   buildKeptConversation,
   historyDiverged,
@@ -101,11 +102,13 @@ export interface SessionPublicState {
   readonly modelCount: number
   readonly lastError: string | null
   readonly cooldownUntil: number | null
+  /** The account's name; "Main" for your normal agy login. */
+  readonly account: string
 }
 
-/** Shown when a session already holds turns from a model outside Antigravity. */
+/** Shown when a session already holds turns from another model or another Antigravity account. */
 export const FOREIGN_HISTORY_MESSAGE =
-  "This session already has replies from another model. Antigravity only continues its own conversations, so it won't read them. Start a new session to use Antigravity."
+  "This session already has replies from another model or another Antigravity account. Antigravity only continues its own conversations, and each session stays on one account, so it won't read them. Start a new session to use this model."
 
 /** Permission metadata key holding agy's warning for an "Allow always" choice. */
 export const ANTIGRAVITY_WARNING_METADATA_KEY = "antigravityWarning"
@@ -222,18 +225,27 @@ interface WarmSpare {
 }
 
 /** Where PDFs are copied for agy to read, like T3 Code's attachments folder. */
-function defaultAttachmentsDir(): string {
+function defaultAttachmentsDir(accountId: string = MAIN_ACCOUNT_ID): string {
   const stateHome = process.env.XDG_STATE_HOME?.trim() || path.join(os.homedir(), ".local", "state")
-  return path.join(stateHome, "opencode-antigravity-acp", "attachments")
+  // Each account has its own folder, so resetting one account's session never
+  // deletes another's files.
+  const name = accountId === MAIN_ACCOUNT_ID ? "attachments" : `attachments-${accountId}`
+  return path.join(stateHome, "opencode-antigravity-acp", name)
 }
 
 function sessionAttachmentsDir(root: string, sessionID: string): string {
   return path.join(root, sessionID.replace(/[^A-Za-z0-9_-]/g, "_"))
 }
 
-const STORAGE_KEY_PREFIX = "antigravity-acp:session:"
-const DELIVERED_TURNS_KEY_PREFIX = "antigravity-acp:turns:"
-const COOLDOWN_STORAGE_KEY = "antigravity-acp:cooldown"
+/** Keys of the main account; an extra account adds its ID after the prefix. */
+function storageKeys(accountId: string) {
+  const scope = accountId === MAIN_ACCOUNT_ID ? "antigravity-acp" : `antigravity-acp:account:${accountId}`
+  return {
+    session: `${scope}:session:`,
+    turns: `${scope}:turns:`,
+    cooldown: `${scope}:cooldown`,
+  }
+}
 const MODEL_CATALOG_STORAGE_KEY = "antigravity-acp:model-catalog:v1"
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000
 
@@ -389,8 +401,24 @@ function buildUsage(
   }
 }
 
+/** The account a bridge runs as: your normal agy login, or an extra account's folder. */
+export interface BridgeAccount {
+  readonly id: string
+  readonly name: string
+  /** The extra account's private folder; absent for the main account. */
+  readonly home?: string
+}
+
+const MAIN_BRIDGE_ACCOUNT: BridgeAccount = { id: MAIN_ACCOUNT_ID, name: "Main" }
+
 export class SessionBridgeManager {
   readonly auth: AcpAuthConfig
+  readonly account: BridgeAccount
+  /** The OpenCode provider whose models run on this account. */
+  readonly providerID: string
+  private readonly keys: ReturnType<typeof storageKeys>
+  /** Marks a reply as Antigravity's. */
+  private readonly acpMarker: Record<string, { acp: true }>
   private sessions = new Map<string, BridgeSession>()
   private catalog: readonly AcpDiscoveredModel[] = FALLBACK_MODELS
   private onStateChanged?: (sessionID: string) => void
@@ -426,14 +454,22 @@ export class SessionBridgeManager {
       readonly auth?: AcpAuthConfig
       /** Folder for attachments agy reads from disk (PDFs); passed with --add-dir. */
       readonly attachmentsDir?: string
+      /** The account this bridge runs as; your normal agy login when omitted. */
+      readonly account?: BridgeAccount
     },
   ) {
     this.auth = options?.auth ?? { method: "oauth-personal" }
-    this.attachmentsDir = options?.attachmentsDir ?? defaultAttachmentsDir()
+    this.account = options?.account ?? MAIN_BRIDGE_ACCOUNT
+    this.providerID = accountProviderID(this.account.id)
+    this.keys = storageKeys(this.account.id)
+    // OpenCode stores a reply's metadata only under its provider's key.
+    this.acpMarker = { [this.providerID]: { acp: true } }
+    this.attachmentsDir = options?.attachmentsDir ?? defaultAttachmentsDir(this.account.id)
     this.onStateChanged = onStateChanged
     this.onCatalogChanged = options?.onCatalogChanged
     this.discoverModelsFn =
-      options?.discoverModels ?? ((cwd) => discoverAcpModels(cwd, { auth: this.auth }))
+      options?.discoverModels ??
+      ((cwd) => discoverAcpModels(cwd, { auth: this.auth, accountHome: this.account.home }))
     const createProc = options?.createProc ?? ((opts: AcpProcessOptions) => new AcpProcess(opts))
     this.createProcFn = (opts) => {
       try {
@@ -442,6 +478,7 @@ export class SessionBridgeManager {
       return createProc({
         ...opts,
         auth: this.auth,
+        ...(this.account.home ? { accountHome: this.account.home } : {}),
         extraDirs: [...(opts.extraDirs ?? []), this.attachmentsDir],
       })
     }
@@ -450,8 +487,9 @@ export class SessionBridgeManager {
     }
   }
 
+  /** Every account lists the same models: the latest catalog any account read. */
   getModels(): readonly AcpDiscoveredModel[] {
-    return this.catalog
+    return sharedCatalog && sharedCatalog.length > 0 ? sharedCatalog : this.catalog
   }
 
   /** Stores a PDF for agy under this session's attachment folder; returns its file URI. */
@@ -609,7 +647,7 @@ export class SessionBridgeManager {
           }
         }
         for (const bucket of COOLDOWN_BUCKETS) {
-          applyRecord(bucket, await read(`${COOLDOWN_STORAGE_KEY}:${bucket}`))
+          applyRecord(bucket, await read(`${this.keys.cooldown}:${bucket}`))
         }
       })()
     }
@@ -620,7 +658,7 @@ export class SessionBridgeManager {
     try {
       Effect.runFork(
         this.ctx.storage
-          .set(`${COOLDOWN_STORAGE_KEY}:${bucket}`, { until, reason })
+          .set(`${this.keys.cooldown}:${bucket}`, { until, reason })
           .pipe(Effect.catch(() => Effect.void)),
       )
     } catch {}
@@ -834,6 +872,14 @@ export class SessionBridgeManager {
     if (idx !== -1) this.warmedIdleSessions.splice(idx, 1)
   }
 
+  /** For an extra account agy cannot use yet: how to sign it in. */
+  signInRequiredMessage(err: unknown): string | undefined {
+    if (!this.account.home) return undefined
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!/Authentication required|No browser is available|not (signed|logged) in|sign in/i.test(msg)) return undefined
+    return `The Antigravity account "${this.account.name}" is not signed in. Run \`agy-accounts login "${this.account.name}"\` in a terminal, then send your message again.`
+  }
+
   getState(sessionID: string): SessionPublicState {
     const s = this.sessions.get(sessionID)
     return {
@@ -844,7 +890,8 @@ export class SessionBridgeManager {
       acpSessionId: s?.acpSessionId ?? null,
       connected: Boolean(s?.proc && !s.proc.isClosed && s.acpSessionId),
       busy: Boolean(s?.activeTurn),
-      modelCount: this.catalog.length,
+      modelCount: this.getModels().length,
+      account: this.account.name,
       lastError: s?.lastError ?? null,
       cooldownUntil: this.activeCooldownForSession(s)?.until ?? null,
     }
@@ -1016,8 +1063,8 @@ export class SessionBridgeManager {
     this.finishUnconfirmedNativeTools(turn)
     const textId = `t_${++turn.partSeq}`
     const meta = local
-      ? { providerMetadata: { [ACP_PROVIDER_ID]: { localStatus: true } } }
-      : { providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } } }
+      ? { providerMetadata: { [this.providerID]: { localStatus: true } } }
+      : { providerMetadata: this.acpMarker }
     this.emitPart(turn, {
       type: "text-start",
       id: textId,
@@ -1124,7 +1171,7 @@ export class SessionBridgeManager {
 
   private async runStorageGet(sessionID: string): Promise<string | undefined> {
     try {
-      const val = await Effect.runPromise(this.ctx.storage.get(`${STORAGE_KEY_PREFIX}${sessionID}`))
+      const val = await Effect.runPromise(this.ctx.storage.get(`${this.keys.session}${sessionID}`))
       return typeof val === "string" && val.length > 0 ? val : undefined
     } catch {
       return undefined
@@ -1134,23 +1181,23 @@ export class SessionBridgeManager {
   private async runStorageSet(sessionID: string, acpSessionId: string): Promise<void> {
     try {
       await Effect.runPromise(
-        this.ctx.storage.set(`${STORAGE_KEY_PREFIX}${sessionID}`, acpSessionId),
+        this.ctx.storage.set(`${this.keys.session}${sessionID}`, acpSessionId),
       )
     } catch {}
   }
 
   private async runStorageRemove(sessionID: string): Promise<void> {
     try {
-      await Effect.runPromise(this.ctx.storage.remove(`${STORAGE_KEY_PREFIX}${sessionID}`))
+      await Effect.runPromise(this.ctx.storage.remove(`${this.keys.session}${sessionID}`))
     } catch {}
     try {
-      await Effect.runPromise(this.ctx.storage.remove(`${DELIVERED_TURNS_KEY_PREFIX}${sessionID}`))
+      await Effect.runPromise(this.ctx.storage.remove(`${this.keys.turns}${sessionID}`))
     } catch {}
   }
 
   private async loadDeliveredTurns(sessionID: string): Promise<DeliveredTurns | undefined> {
     try {
-      const raw = await Effect.runPromise(this.ctx.storage.get(`${DELIVERED_TURNS_KEY_PREFIX}${sessionID}`))
+      const raw = await Effect.runPromise(this.ctx.storage.get(`${this.keys.turns}${sessionID}`))
       return isDeliveredTurns(raw) ? raw : undefined
     } catch {
       return undefined
@@ -1160,7 +1207,7 @@ export class SessionBridgeManager {
   private async saveDeliveredTurns(sessionID: string, record: DeliveredTurns): Promise<void> {
     try {
       await Effect.runPromise(
-        this.ctx.storage.set(`${DELIVERED_TURNS_KEY_PREFIX}${sessionID}`, record as any),
+        this.ctx.storage.set(`${this.keys.turns}${sessionID}`, record as any),
       )
     } catch {}
   }
@@ -1696,7 +1743,7 @@ export class SessionBridgeManager {
         toolName: call.openCodeToolName,
         input: jsonInput,
         providerExecuted: false,
-        providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+        providerMetadata: this.acpMarker,
       })
     }
 
@@ -1708,7 +1755,7 @@ export class SessionBridgeManager {
       type: "finish",
       finishReason,
       usage: buildUsage(),
-      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      providerMetadata: this.acpMarker,
     })
     const ctrl = this.detachController(turn)
     try {
@@ -1773,7 +1820,7 @@ export class SessionBridgeManager {
   /** A plugin notice shown in the turn; marked local so it is never sent to agy. */
   private emitLocalNotice(turn: ActiveTurn, text: string): void {
     const id = `t_${++turn.partSeq}`
-    const meta = { providerMetadata: { [ACP_PROVIDER_ID]: { localStatus: true } } }
+    const meta = { providerMetadata: { [this.providerID]: { localStatus: true } } }
     this.emitPart(turn, { type: "text-start", id, ...meta })
     this.emitPart(turn, { type: "text-delta", id, delta: text })
     this.emitPart(turn, { type: "text-end", id, ...meta })
@@ -1786,7 +1833,7 @@ export class SessionBridgeManager {
       this.emitPart(turn, {
         type: "reasoning-end",
         id,
-        providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+        providerMetadata: this.acpMarker,
       })
     }
     if (turn.openTextId) {
@@ -1795,7 +1842,7 @@ export class SessionBridgeManager {
       this.emitPart(turn, {
         type: "text-end",
         id,
-        providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+        providerMetadata: this.acpMarker,
       })
     }
   }
@@ -1856,7 +1903,7 @@ export class SessionBridgeManager {
         this.emitPart(turn, {
           type: "text-end",
           id: tid,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+          providerMetadata: this.acpMarker,
         })
       }
       if (!turn.openReasoningId) {
@@ -1864,7 +1911,7 @@ export class SessionBridgeManager {
         this.emitPart(turn, {
           type: "reasoning-start",
           id: turn.openReasoningId,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+          providerMetadata: this.acpMarker,
         })
       }
       this.emitPart(turn, {
@@ -1937,7 +1984,7 @@ export class SessionBridgeManager {
         this.emitPart(turn, {
           type: "reasoning-end",
           id: rid,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+          providerMetadata: this.acpMarker,
         })
       }
       if (!turn.openTextId) {
@@ -1945,7 +1992,7 @@ export class SessionBridgeManager {
         this.emitPart(turn, {
           type: "text-start",
           id: turn.openTextId,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+          providerMetadata: this.acpMarker,
         })
       }
       this.emitPart(turn, {
@@ -1998,7 +2045,7 @@ export class SessionBridgeManager {
           toolName: displayName,
           input: jsonInput,
           providerExecuted: true,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+          providerMetadata: this.acpMarker,
         })
       }
 
@@ -2012,7 +2059,7 @@ export class SessionBridgeManager {
           toolName: displayName,
           result: (resultPayload ?? { status }) as any,
           isError,
-          providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+          providerMetadata: this.acpMarker,
         })
 
         // If any OpenCode questions were waiting for this native tool to settle, flush them now!
@@ -2035,7 +2082,7 @@ export class SessionBridgeManager {
       toolName,
       result: { status: "asked", message: "Asked the user with OpenCode's question tool." },
       isError: false,
-      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      providerMetadata: this.acpMarker,
     })
   }
 
@@ -2050,7 +2097,7 @@ export class SessionBridgeManager {
           message: "ACP did not report a final status for this tool call.",
         },
         isError: true,
-        providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+        providerMetadata: this.acpMarker,
       })
     }
     turn.activeNativeTools.clear()
@@ -2093,7 +2140,7 @@ export class SessionBridgeManager {
       type: "finish",
       finishReason: { unified, raw: stopReason ?? "end_turn" },
       usage: buildUsage(turn.promptResult?.usage, s.lastContextUsed),
-      providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+      providerMetadata: this.acpMarker,
     })
 
     const ctrl = this.detachController(turn)
@@ -2114,7 +2161,7 @@ export class SessionBridgeManager {
     // turns that ran through `agy acp`. Tagged with a localStatus marker so
     // hasNonAcpAssistantHistory skips them: they are not another model's turn.
     const id = "t_1"
-    const localMeta = { providerMetadata: { [ACP_PROVIDER_ID]: { localStatus: true } } } as const
+    const localMeta = { providerMetadata: { [this.providerID]: { localStatus: true } } } as const
     return new ReadableStream<LanguageModelV3StreamPart>({
       start: (controller) => {
         controller.enqueue({ type: "stream-start", warnings: [] })
@@ -2144,7 +2191,7 @@ export class SessionBridgeManager {
     const bridge = this
     return {
       specificationVersion: "v3",
-      provider: ACP_PROVIDER_ID,
+      provider: bridge.providerID,
       modelId: modelID,
       supportedUrls: {},
       async doGenerate(options: LanguageModelV3CallOptions) {
@@ -2277,7 +2324,7 @@ export class SessionBridgeManager {
 
         let target: ReturnType<typeof resolveAcpModelTarget>
         try {
-          target = resolveAcpModelTarget(bridge.catalog, modelID, variant)
+          target = resolveAcpModelTarget(bridge.getModels(), modelID, variant)
         } catch (err) {
           if (!(err instanceof UnavailableModelError)) throw err
           return { stream: bridge.createImmediateTextStream(err.message, "model_unavailable") }
@@ -2426,6 +2473,12 @@ export class SessionBridgeManager {
             return {
               stream: bridge.createImmediateTextStream(msg, "agy_unavailable"),
             }
+          }
+          const signIn = bridge.signInRequiredMessage(err)
+          if (signIn) {
+            s.lastError = signIn
+            bridge.notifyChanged(sessionID)
+            return { stream: bridge.createImmediateTextStream(signIn, "sign_in_required") }
           }
           throw err
         }

@@ -4,21 +4,130 @@ import http from "node:http";
 // src/quota.ts
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
+
+// ../src/accounts.ts
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// ../src/account-ids.ts
+var MAIN_PROVIDER_ID = "antigravity-acp";
+var MAIN_ACCOUNT_ID = "main";
+var ACCOUNT_PROVIDER_PREFIX = `${MAIN_PROVIDER_ID}-`;
+
+// ../src/accounts.ts
+var ACCOUNT_APP_DATA_DIR = "antigravity-acp";
+var REGISTRY_FILE = "accounts.json";
+var NAME_MAX = 40;
+function stateDir(env = process.env) {
+  const override = env.ANTIGRAVITY_ACP_STATE_DIR?.trim();
+  if (override)
+    return override;
+  const home = env.HOME || os.homedir();
+  const stateHome = env.XDG_STATE_HOME?.trim() || path.join(home, ".local", "state");
+  return path.join(stateHome, "opencode-antigravity-acp");
+}
+function registryPath(env = process.env) {
+  return path.join(stateDir(env), REGISTRY_FILE);
+}
+function accountHome(accountId, env = process.env) {
+  return path.join(stateDir(env), "accounts", accountId);
+}
+function isValidId(id) {
+  return typeof id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(id) && id !== MAIN_ACCOUNT_ID;
+}
+function readAccounts(env = process.env) {
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(registryPath(env), "utf8"));
+  } catch {
+    return [];
+  }
+  const list = raw?.accounts;
+  if (!Array.isArray(list))
+    return [];
+  const seen = new Set;
+  const accounts = [];
+  for (const item of list) {
+    const id = item?.id;
+    const name = item?.name;
+    if (!isValidId(id) || seen.has(id) || typeof name !== "string" || !name.trim())
+      continue;
+    seen.add(id);
+    const createdAt = item?.createdAt;
+    accounts.push({ id, name: name.trim().slice(0, NAME_MAX), createdAt: typeof createdAt === "number" ? createdAt : 0 });
+  }
+  return accounts;
+}
+function accountAgyArgs(home) {
+  return ["--gemini_dir", home, "--app_data_dir", ACCOUNT_APP_DATA_DIR];
+}
+var FOREIGN_CREDENTIAL_KEYS = [
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_CLOUD_QUOTA_PROJECT",
+  "GOOGLE_GENAI_USE_VERTEXAI",
+  "GCLOUD_PROJECT",
+  "CLOUDSDK_CORE_PROJECT"
+];
+function accountAgyEnv(home, base = process.env) {
+  const env = {};
+  const doomed = new Set(FOREIGN_CREDENTIAL_KEYS);
+  for (const [key, value] of Object.entries(base)) {
+    if (!doomed.has(process.platform === "win32" ? key.toUpperCase() : key))
+      env[key] = value;
+  }
+  env.GEMINI_HOME = home;
+  env.AGY_ACP_FORCE_FILE_STORAGE = "1";
+  env.SSH_CONNECTION = base.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0";
+  return env;
+}
+function isLoginFile(name) {
+  return name.endsWith("oauth-token") || name === "acp_token.json";
+}
+function savedLoginFiles(home) {
+  const files = [];
+  for (const dir of [home, path.join(home, ACCOUNT_APP_DATA_DIR)]) {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const file = path.join(dir, name);
+      try {
+        if (isLoginFile(name) && fs.lstatSync(file).isFile())
+          files.push(file);
+      } catch {}
+    }
+  }
+  return files;
+}
+function hasSavedLogin(home) {
+  return savedLoginFiles(home).length > 0;
+}
+
+// src/quota.ts
 var FIVE_HOURS = 5 * 3600;
 var DAY = 24 * 3600;
 var WEEK = 7 * DAY;
 var AGY_TIMEOUT_MS = 15000;
+var PARALLEL_READS = 3;
 var ERROR_MAX = 2000;
 function resolveAgyBinary(env = process.env) {
   const override = env.AGY_BIN?.trim();
   if (override)
     return override;
-  const home = env.HOME || os.homedir();
+  const home = env.HOME || os2.homedir();
   const candidates = [
-    ...(env.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, "agy")),
-    path.join(home, ".local", "bin", "agy"),
+    ...(env.PATH ?? "").split(path2.delimiter).filter(Boolean).map((dir) => path2.join(dir, "agy")),
+    path2.join(home, ".local", "bin", "agy"),
     "/opt/homebrew/bin/agy",
     "/usr/local/bin/agy"
   ];
@@ -89,9 +198,10 @@ function toUsageData(output) {
 function failure(error) {
   return { ok: false, configured: true, error: error.slice(0, ERROR_MAX), usage: null };
 }
-function runAgyQuota(binary = resolveAgyBinary(), cwd = defaultCwd()) {
+function runAgyQuota(binary = resolveAgyBinary(), cwd = defaultCwd(), home) {
   return new Promise((resolve) => {
-    execFile(binary, ["-p", "/quota", "--output-format", "json"], { cwd, env: agyEnv(), timeout: AGY_TIMEOUT_MS, maxBuffer: 1e6 }, (error, stdout, stderr) => {
+    const args = ["-p", "/quota", "--output-format", "json", ...home ? accountAgyArgs(home) : []];
+    const child = execFile(binary, args, { cwd, env: home ? accountAgyEnv(home, agyEnv()) : agyEnv(), timeout: AGY_TIMEOUT_MS, maxBuffer: 1e6 }, (error, stdout, stderr) => {
       if (error && error.code === "ENOENT") {
         resolve(failure(`agy was not found (${binary}). Install the Antigravity CLI or set AGY_BIN.`));
         return;
@@ -112,10 +222,31 @@ function runAgyQuota(binary = resolveAgyBinary(), cwd = defaultCwd()) {
       }
       resolve(toUsageData(parsed));
     });
+    child.stdin?.end();
   });
 }
+async function readAllQuotas(binary = resolveAgyBinary(), cwd = defaultCwd(), env = process.env) {
+  const jobs = [
+    async () => ({ id: MAIN_ACCOUNT_ID, name: "Main", data: await runAgyQuota(binary, cwd) }),
+    ...readAccounts(env).map((account) => async () => {
+      const home = accountHome(account.id, env);
+      const data = hasSavedLogin(home) ? await runAgyQuota(binary, cwd, home) : failure(`Not signed in. Run: agy-accounts login "${account.name}"`);
+      return { id: account.id, name: account.name, data };
+    })
+  ];
+  const results = new Array(jobs.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < jobs.length) {
+      const i = next++;
+      results[i] = await jobs[i]();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PARALLEL_READS, jobs.length) }, worker));
+  return { accounts: results };
+}
 function defaultCwd() {
-  const dir = process.env.OPENCHAMBER_SERVICE_DATA_DIR || path.join(os.tmpdir(), "antigravity-quota");
+  const dir = process.env.OPENCHAMBER_SERVICE_DATA_DIR || path2.join(os2.tmpdir(), "antigravity-quota");
   try {
     mkdirSync(dir, { recursive: true });
   } catch {}
@@ -135,8 +266,8 @@ var cached;
 var readQuota = () => {
   if (cached && Date.now() - cached.at < CACHE_MS)
     return Promise.resolve(cached.data);
-  inFlight ??= runAgyQuota().then((data) => {
-    cached = data.ok ? { at: Date.now(), data } : undefined;
+  inFlight ??= readAllQuotas().then((data) => {
+    cached = data.accounts.some((a) => a.data.ok) ? { at: Date.now(), data } : undefined;
     return data;
   }).finally(() => {
     inFlight = undefined;

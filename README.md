@@ -27,7 +27,7 @@ Like T3 Code's Antigravity provider:
 
 Google's [Antigravity Terms](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq#why-cant-i-use-third-party-software-such-as-claude-code-openclaw-or-opencode-with-my-antigravity-login) restrict third-party software that uses an Antigravity login. Google's CLI team has said that connecting an ACP client such as Zed, JetBrains or T3 Code to the official `agy acp` server for single-user, interactive sessions is supported, and that extracting or proxying OAuth tokens into third-party agents, wrapping `agy -p` in autonomous agents, and multi-account pooling are not ([antigravity-cli#1411](https://github.com/google-antigravity/antigravity-cli/issues/1411)). The FAQ still names OpenCode, though, so this is not an official statement that this plugin is allowed.
 
-Use it for your own interactive sessions, on one account. For unattended automation, or to avoid the question entirely, select the **Gemini API key** or **Agent Platform** sign-in method. You are responsible for following Google's terms; every request uses your account and its quota.
+Use it for your own interactive sessions. Separate accounts (below) are each picked by you per session, as in T3 Code; the plugin never rotates or pools them, and you should not use them to get around one account's limits. For unattended automation, or to avoid the question entirely, select the **Gemini API key** or **Agent Platform** sign-in method. You are responsible for following Google's terms; every request uses your account and its quota.
 
 ---
 
@@ -56,6 +56,35 @@ Set the method in the plugin's options in `opencode.json(c)`:
 The same values can come from `ANTIGRAVITY_ACP_AUTH_METHOD`, `ANTIGRAVITY_ACP_API_KEY`, `ANTIGRAVITY_ACP_GCP_PROJECT` and `ANTIGRAVITY_ACP_GCP_LOCATION`; plugin options win. Keep API keys out of committed config files: use the environment variables. A method missing what it needs stops the plugin from loading with an error, rather than using another method.
 
 For the Google account methods, sign in once with `agy` (or `agy acp --login` over SSH).
+
+---
+
+## Separate accounts
+
+Like T3 Code, the plugin can run more than one Google account side by side. Your normal `agy` login stays the **Antigravity (ACP)** provider. Each extra account becomes its own provider, such as **Antigravity (Work)**, with the same models and its own private folder and sign-in. You choose the account for a session by picking one of its models. Nothing switches accounts on its own, not even when one runs out of quota.
+
+Add and sign in an account in a terminal:
+
+```bash
+node ~/path/to/opencode-antigravity-acp/bin/agy-accounts.js add "Work"
+```
+
+(After `npm install -g` or with the package on your `PATH`, it is just `agy-accounts`.) It prints a Google link: open it, sign in with that account, and paste the code back. Then restart OpenCode.
+
+| Command | What it does |
+| :--- | :--- |
+| `agy-accounts list` | Accounts, their provider ID and whether they are signed in |
+| `agy-accounts add <name>` | Add an account and sign it in |
+| `agy-accounts login <name>` | Sign it in again, or into another Google account |
+| `agy-accounts logout <name>` | Delete its saved Google login |
+| `agy-accounts rename <name> <new>` | Change the name shown in OpenCode |
+| `agy-accounts remove <name>` | Remove it and delete its folder |
+
+- Each account lives in `~/.local/state/opencode-antigravity-acp/accounts/<id>` (set `ANTIGRAVITY_ACP_STATE_DIR` to move it). As in T3 Code, the plugin starts `agy` with that folder as `GEMINI_HOME`, `--gemini_dir` and `--app_data_dir antigravity-acp`, with `AGY_ACP_FORCE_FILE_STORAGE=1` and a placeholder `SSH_CONNECTION`, so the login is kept in a file in that folder instead of the OS keyring entry every account would share. Google API keys and Cloud variables are removed from its environment.
+- Your `AGENTS.md`, `GEMINI.md` and skills in `~/.gemini` are linked into each folder, so every account follows the same rules. Logins and MCP settings stay separate.
+- Extra accounts always use their own Google login, whatever `authMethod` the main provider uses.
+- A session stays on one account. Antigravity keeps each conversation on the account that held it, so after another account has replied in a session, a different account's models decline to continue it, as they do for another model's replies. Start a new session instead.
+- A signed-out account answers with the command to sign it in.
 
 ---
 
@@ -131,7 +160,7 @@ When an **Antigravity (ACP)** model is active, an **`ACP`** pill appears above t
   - `Accept edits` — Approves file edits; prompts before shell commands.
   - `Ask` — Prompts before file edits and shell commands.
   - `Plan` — Creates a plan before executing changes.
-- **Sign-in:** the chip in the popover shows the method in use, such as `Google account`.
+- **Sign-in:** the chip in the popover shows the method in use, such as `Google account`, and the account name for an extra account.
 - **Actions & Slash commands:**
   - `/agy-reset` — Disposes and resets the active Antigravity ACP session for the current session (background command).
   - `/agy-reload` — Forces live model & reasoning-effort discovery from `agy acp` and reloads providers.
@@ -140,7 +169,7 @@ When an **Antigravity (ACP)** model is active, an **`ACP`** pill appears above t
 
 ## Quota in OpenChamber
 
-[`openchamber-quota/`](./openchamber-quota) is an OpenChamber extension that shows your Antigravity 5-hour and weekly limits per model group in an **Antigravity** section of Work Status, and in a notification when you type `/agy-quota` in the chat box. It reads them from `agy`'s own `/quota` command, using your existing `agy` login, and runs no model turn. Add the folder in **Settings → Extensions** and allow its local service.
+[`openchamber-quota/`](./openchamber-quota) is an OpenChamber extension that shows your Antigravity 5-hour and weekly limits per model group in an **Antigravity** section of Work Status, and in a notification when you type `/agy-quota` in the chat box. It reads them from `agy`'s own `/quota` command, for your normal `agy` login and every [separate account](#separate-accounts), and runs no model turn. Add the folder in **Settings → Extensions** and allow its local service.
 
 ---
 

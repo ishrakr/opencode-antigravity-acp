@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test"
-import { antigravityModelOf, groupMatchesModel, quotaSummary, shortGroupName, toGroupViews, toneFor } from "../src/view.ts"
-import { toUsageData } from "../src/quota.ts"
+import {
+  antigravityTargetOf,
+  groupMatchesModel,
+  quotaSummary,
+  readAccountsQuota,
+  shortGroupName,
+  toAccountViews,
+  toGroupViews,
+  toneFor,
+} from "../src/view.ts"
+import { failure, toUsageData, type AccountsQuota } from "../src/quota.ts"
 
 const usage = toUsageData({
   status: "SUCCESS",
@@ -26,14 +35,17 @@ const usage = toUsageData({
   },
 })
 
-describe("which sessions show the quota", () => {
-  test("only models from the Antigravity provider", () => {
-    expect(antigravityModelOf("antigravity-acp/gemini-4-neon")).toBe("gemini-4-neon")
-    expect(antigravityModelOf("antigravity-acp/claude-opus-5-5")).toBe("claude-opus-5-5")
-    expect(antigravityModelOf("fs-cortex/claude-opus-latest")).toBeNull()
-    expect(antigravityModelOf("google/gemini-3-pro")).toBeNull()
-    expect(antigravityModelOf(undefined)).toBeNull()
-    expect(antigravityModelOf("antigravity-acp")).toBeNull()
+const main = (data = usage): AccountsQuota => ({ accounts: [{ id: "main", name: "Main", data }] })
+
+describe("which sessions are Antigravity's", () => {
+  test("the main provider and each account's provider", () => {
+    expect(antigravityTargetOf("antigravity-acp/gemini-4-neon")).toEqual({ account: "main", modelId: "gemini-4-neon" })
+    expect(antigravityTargetOf("antigravity-acp-work/claude-opus-5-5")).toEqual({ account: "work", modelId: "claude-opus-5-5" })
+    expect(antigravityTargetOf("fs-cortex/claude-opus-latest")).toBeNull()
+    expect(antigravityTargetOf("google/gemini-3-pro")).toBeNull()
+    expect(antigravityTargetOf(undefined)).toBeNull()
+    expect(antigravityTargetOf("antigravity-acp")).toBeNull()
+    expect(antigravityTargetOf("antigravity-acp-/gemini")).toBeNull()
   })
 })
 
@@ -79,7 +91,7 @@ describe("/agy-quota summary", () => {
   const now = Date.parse("2026-11-23T20:00:00Z")
 
   test("lists every group with what is left and when it refills", () => {
-    const text = quotaSummary(usage, now, null, "en-US")
+    const text = quotaSummary(main(), now, null, "en-US")
     const lines = text.split("\n")
     expect(lines[0]).toBe("Antigravity quota")
     expect(lines[1]).toStartWith("Gemini: 5-hour 94% left, refills ")
@@ -91,18 +103,18 @@ describe("/agy-quota summary", () => {
   })
 
   test("puts the session's group first and marks it", () => {
-    const lines = quotaSummary(usage, now, "claude-opus-5-5", "en-US").split("\n")
+    const lines = quotaSummary(main(), now, { account: "main", modelId: "claude-opus-5-5" }, "en-US").split("\n")
     expect(lines[1]).toStartWith("Claude & GPT (this session): ")
     expect(lines[2]).toStartWith("Gemini: ")
   })
 
   test("omits refill times that have passed", () => {
     const later = Date.parse("2026-12-01T00:00:00Z")
-    expect(quotaSummary(usage, later, null, "en-US")).not.toContain("refills")
+    expect(quotaSummary(main(), later, null, "en-US")).not.toContain("refills")
   })
 
   test("shows agy's error", () => {
-    expect(quotaSummary({ ok: false, configured: true, error: "agy was not found", usage: null }, now)).toBe("agy was not found")
+    expect(quotaSummary(main(failure("agy was not found")), now)).toBe("agy was not found")
   })
 })
 
@@ -115,5 +127,60 @@ describe("refill times", () => {
     expect(unused.usage?.models?.["Claude and GPT models"]?.windows["5h"]?.resetAt).toBeNull()
     const zero = { ok: true, configured: true, usage: { windows: {}, models: { "Claude and GPT models": { windows: { "5h": { usedPercent: 0, windowSeconds: 18000, resetAt: 0 } } } } } } as const
     expect(toGroupViews(zero as any)[0].windows[0].resetAt).toBeNull()
+  })
+})
+
+describe("several accounts", () => {
+  const now = Date.parse("2026-11-23T20:00:00Z")
+  const quota: AccountsQuota = {
+    accounts: [
+      { id: "main", name: "Main", data: usage },
+      { id: "work", name: "Work", data: usage },
+      { id: "spare", name: "Spare", data: failure('Not signed in. Run: agy-accounts login "Spare"') },
+    ],
+  }
+
+  test("every account shows; the session's account comes first with its group marked", () => {
+    const views = toAccountViews(quota, { account: "work", modelId: "gemini-4-neon" })
+    expect(views.map((v) => [v.name, v.current])).toEqual([
+      ["Work", true],
+      ["Main", false],
+      ["Spare", false],
+    ])
+    expect(views[0].groups[0]).toMatchObject({ name: "Gemini", current: true })
+    // The same model on another account is not this session's quota.
+    expect(views[1].groups.some((g) => g.current)).toBe(false)
+    expect(views[2].error).toContain("agy-accounts login")
+  })
+
+  test("outside Antigravity sessions nothing is marked, in the order added", () => {
+    const views = toAccountViews(quota)
+    expect(views.map((v) => v.name)).toEqual(["Main", "Work", "Spare"])
+    expect(views.some((v) => v.current)).toBe(false)
+  })
+
+  test("the summary names each account and fits a toast", () => {
+    const text = quotaSummary(quota, now, { account: "work", modelId: "claude-opus-5-5" }, "en-US")
+    const lines = text.split("\n")
+    expect(lines[1]).toBe("Work (this session)")
+    expect(lines[2]).toStartWith("  Claude & GPT (this session): ")
+    expect(text).toContain("\nMain\n")
+    expect(text).toContain('  Not signed in. Run: agy-accounts login "Spare"')
+    expect(text.length).toBeLessThanOrEqual(500)
+  })
+
+  test("refill times go first when every account would not fit", () => {
+    const many: AccountsQuota = {
+      accounts: Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, name: `Account ${i}`, data: usage })),
+    }
+    const text = quotaSummary(many, now, null, "en-US")
+    expect(text).not.toContain("refills")
+    expect(text).toContain("Account 3")
+    expect(text.length).toBeLessThanOrEqual(500)
+  })
+
+  test("an older service's single-account answer still reads", () => {
+    expect(readAccountsQuota(usage)).toEqual(main())
+    expect(readAccountsQuota(quota)).toEqual(quota)
   })
 })

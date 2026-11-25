@@ -1,8 +1,7 @@
 // Local service for the Antigravity section in Work Status. OpenChamber starts
 // it; the section reads the quota from GET /usage through the host proxy.
 import http from "node:http"
-import type { QuotaProviderUsageData } from "@openchamber/sdk"
-import { runAgyQuota } from "./quota.ts"
+import { readAllQuotas, type AccountsQuota } from "./quota.ts"
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT)
 const serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN ?? ""
@@ -12,17 +11,18 @@ if (!port || !serviceToken) {
 }
 
 /**
- * Each read starts agy (about 2 s and 240 MB). Refreshes from several screens
- * share one run, and a good reading is reused for a minute.
+ * Each read starts agy once per account (about 2 s and 240 MB each).
+ * Refreshes from several screens share one run, and a reading where the main
+ * account succeeded is reused for a minute.
  */
 const CACHE_MS = 60_000
-let inFlight: ReturnType<typeof runAgyQuota> | undefined
-let cached: { at: number; data: Awaited<ReturnType<typeof runAgyQuota>> } | undefined
+let inFlight: Promise<AccountsQuota> | undefined
+let cached: { at: number; data: AccountsQuota } | undefined
 const readQuota = () => {
   if (cached && Date.now() - cached.at < CACHE_MS) return Promise.resolve(cached.data)
-  inFlight ??= runAgyQuota()
+  inFlight ??= readAllQuotas()
     .then((data) => {
-      cached = data.ok ? { at: Date.now(), data } : undefined
+      cached = data.accounts.some((a) => a.data.ok) ? { at: Date.now(), data } : undefined
       return data
     })
     .finally(() => {
@@ -31,7 +31,7 @@ const readQuota = () => {
   return inFlight
 }
 
-const send = (res: http.ServerResponse, status: number, body: QuotaProviderUsageData | { ok: true } | { error: string }): void => {
+const send = (res: http.ServerResponse, status: number, body: AccountsQuota | { ok: true } | { error: string }): void => {
   res.writeHead(status, { "Content-Type": "application/json" })
   res.end(JSON.stringify(body))
 }

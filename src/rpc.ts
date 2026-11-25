@@ -14,12 +14,16 @@ export interface AcpSessionState {
   readonly modelCount: number
   readonly lastError: string | null
   readonly cooldownUntil: number | null
+  /** The account's name; "Main" for your normal agy login. */
+  readonly account: string
 }
 
+// providerID picks the account; the main account when omitted.
 const sessionIdSchema = {
   type: "object",
   properties: {
     sessionID: { type: "string" },
+    providerID: { type: "string" },
   },
   required: ["sessionID"],
   additionalProperties: false,
@@ -38,6 +42,7 @@ const stateSchema = {
     modelCount: { type: "number" },
     lastError: { anyOf: [{ type: "string" }, { type: "null" }] },
     cooldownUntil: { anyOf: [{ type: "number" }, { type: "null" }] },
+    account: { type: "string" },
   },
   required: [
     "sessionID",
@@ -50,6 +55,7 @@ const stateSchema = {
     "modelCount",
     "lastError",
     "cooldownUntil",
+    "account",
   ],
   additionalProperties: false,
 } as const
@@ -66,6 +72,7 @@ export const AcpRpc = Rpc.define({
         type: "object",
         properties: {
           sessionID: { type: "string" },
+          providerID: { type: "string" },
           mode: { type: "string", enum: ["auto", "accept-edits", "default", "plan"] },
         },
         required: ["sessionID", "mode"],
@@ -82,6 +89,7 @@ export const AcpRpc = Rpc.define({
         type: "object",
         properties: {
           sessionID: { type: "string" },
+          providerID: { type: "string" },
         },
         additionalProperties: false,
       },

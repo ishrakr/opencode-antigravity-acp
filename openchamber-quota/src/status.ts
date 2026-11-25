@@ -1,8 +1,19 @@
-// The Antigravity section in Work Status. It shows the quota in every session;
-// in an Antigravity session that session's group comes first.
-import { connectHost, HostRequestError, type QuotaProviderUsageData } from "@openchamber/sdk"
+// The Antigravity section in Work Status. It shows every account's quota in
+// every session; in an Antigravity session that session's account and group
+// come first.
+import { connectHost, HostRequestError } from "@openchamber/sdk"
 import { applyHostReady } from "@openchamber/sdk/ui"
-import { antigravityModelOf, formatReset, toGroupViews, type GroupView } from "./view.ts"
+import type { AccountsQuota } from "./quota.ts"
+import {
+  antigravityTargetOf,
+  formatReset,
+  readAccountsQuota,
+  sameTarget,
+  toAccountViews,
+  type AccountView,
+  type GroupView,
+  type SessionTarget,
+} from "./view.ts"
 
 const REFRESH_MS = 60_000
 
@@ -22,6 +33,11 @@ style.textContent = `
   .group.other { opacity: .7; }
   .name { display: flex; align-items: baseline; gap: 6px; font-weight: 600; }
   .tag { font-weight: 400; font-size: 11px; color: var(--oc-muted); }
+  .account { display: flex; flex-direction: column; gap: 6px; }
+  .account + .account { border-top: 1px solid var(--oc-border); padding-top: 8px; }
+  .account.other { opacity: .75; }
+  .account-name { display: flex; align-items: baseline; gap: 6px; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--oc-muted); }
+  .account-name .tag { text-transform: none; letter-spacing: 0; }
   .line { display: grid; grid-template-columns: 52px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
   .what { color: var(--oc-muted); }
   .meter { height: 5px; border-radius: 3px; overflow: hidden; background: color-mix(in srgb, var(--oc-fg) 8%, transparent); }
@@ -46,8 +62,8 @@ const el = (tag: string, className = "", text = ""): HTMLElement => {
 }
 
 let locale: string | undefined
-let modelId: string | null = null
-let data: QuotaProviderUsageData | null = null
+let target: SessionTarget | null = null
+let data: AccountsQuota | null = null
 let failure: string | null = null
 let loading = false
 let lastRead = 0
@@ -78,6 +94,21 @@ function drawGroup(group: GroupView, now: number, marked: boolean): HTMLElement 
   return box
 }
 
+function drawGroups(account: AccountView, now: number): HTMLElement[] {
+  if (account.error) return [el("div", "note error", account.error)]
+  // Outside the session's own account no group is dimmed.
+  const marked = account.groups.some((group) => group.current)
+  return account.groups.map((group) => drawGroup(group, now, marked))
+}
+
+function drawAccount(account: AccountView, now: number, marked: boolean): HTMLElement {
+  const box = el("div", account.current || !marked ? "account" : "account other")
+  const name = el("div", "account-name", account.name)
+  if (account.current) name.append(el("span", "tag", "this session"))
+  box.append(name, ...drawGroups(account, now))
+  return box
+}
+
 function render(): void {
   if (failure) {
     note(failure, true)
@@ -87,19 +118,19 @@ function render(): void {
     note("Reading quota…")
     return
   }
-  if (!data.ok || !data.usage) {
-    note(data.error ?? "agy reported no quota.", true)
-    return
-  }
   const now = Date.now()
-  const groups = toGroupViews(data, modelId)
-  if (groups.length === 0) {
-    note("agy reported no quota groups.")
+  const accounts = toAccountViews(data, target)
+  if (accounts.length === 0) {
+    note("agy reported no quota.")
     return
   }
-  // Outside Antigravity sessions no group is dimmed.
-  const marked = groups.some((group) => group.current)
-  root.replaceChildren(...groups.map((group) => drawGroup(group, now, marked)))
+  // With only your normal login, the section looks as it did before accounts.
+  if (accounts.length === 1) {
+    root.replaceChildren(...drawGroups(accounts[0], now))
+    return
+  }
+  const marked = accounts.some((account) => account.current)
+  root.replaceChildren(...accounts.map((account) => drawAccount(account, now, marked)))
 }
 
 function failureText(error: unknown): string {
@@ -116,7 +147,7 @@ async function read(): Promise<void> {
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/usage" })
     if (result.status !== 200) throw new Error(`status ${result.status}`)
-    data = JSON.parse(result.body) as QuotaProviderUsageData
+    data = readAccountsQuota(JSON.parse(result.body))
     failure = null
     lastRead = Date.now()
   } catch (error) {
@@ -127,7 +158,7 @@ async function read(): Promise<void> {
   }
 }
 
-// The host sizes the frame to the content: one line outside Antigravity sessions.
+// The host sizes the frame to the content.
 let reportedHeight = -1
 new ResizeObserver(() => {
   const height = Math.ceil(root.getBoundingClientRect().height)
@@ -143,9 +174,9 @@ host.onReady((context) => {
 })
 
 host.onSession((session) => {
-  const next = antigravityModelOf(session?.model)
-  if (next === modelId) return
-  modelId = next
+  const next = antigravityTargetOf(session?.model)
+  if (sameTarget(next, target)) return
+  target = next
   render()
   if (Date.now() - lastRead > REFRESH_MS / 2) void read()
 })

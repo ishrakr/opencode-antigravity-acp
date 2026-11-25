@@ -1,14 +1,29 @@
 // What the Work Status section shows, kept free of the DOM so it can be tested.
 import type { QuotaProviderUsageData, QuotaProviderWindow } from "@openchamber/sdk"
+import { MAIN_ACCOUNT_ID, accountIdOfProvider } from "../../src/account-ids.ts"
+import type { AccountQuota, AccountsQuota } from "./quota.ts"
 
-/** The OpenCode provider the Antigravity plugin registers its models under. */
-export const ANTIGRAVITY_PROVIDER_ID = "antigravity-acp"
+/** The Antigravity account and model a session uses. */
+export interface SessionTarget {
+  /** "main" for your normal agy login, else the extra account's ID. */
+  readonly account: string
+  readonly modelId: string
+}
 
-/** `model` is OpenChamber's `providerID/modelID`, absent before the first reply. */
-export function antigravityModelOf(model: string | undefined | null): string | null {
+/**
+ * `model` is OpenChamber's `providerID/modelID`, absent before the first
+ * reply. Null outside Antigravity; each account is its own provider.
+ */
+export function antigravityTargetOf(model: string | undefined | null): SessionTarget | null {
   const slash = model?.indexOf("/") ?? -1
   if (!model || slash < 0) return null
-  return model.slice(0, slash) === ANTIGRAVITY_PROVIDER_ID ? model.slice(slash + 1) : null
+  const account = accountIdOfProvider(model.slice(0, slash))
+  const modelId = model.slice(slash + 1)
+  return account && modelId ? { account, modelId } : null
+}
+
+export function sameTarget(a: SessionTarget | null, b: SessionTarget | null): boolean {
+  return a?.account === b?.account && a?.modelId === b?.modelId
 }
 
 /** agy bills Gemini models in one group and every other model (Claude, GPT) in the other. */
@@ -82,6 +97,45 @@ export function toGroupViews(data: QuotaProviderUsageData, modelId: string | nul
   return groups.sort((a, b) => Number(b.current) - Number(a.current))
 }
 
+export interface AccountView {
+  readonly id: string
+  readonly name: string
+  /** The account the session uses. */
+  readonly current: boolean
+  readonly groups: readonly GroupView[]
+  /** Why there is no quota for this account. */
+  readonly error: string | null
+}
+
+/** The service's answer; an older service answered one account's usage directly. */
+export function readAccountsQuota(body: unknown): AccountsQuota {
+  const accounts = (body as AccountsQuota | null)?.accounts
+  if (Array.isArray(accounts)) return { accounts }
+  return { accounts: [{ id: MAIN_ACCOUNT_ID, name: "Main", data: body as QuotaProviderUsageData }] }
+}
+
+function toAccountView(account: AccountQuota, target: SessionTarget | null): AccountView {
+  const current = target?.account === account.id
+  const data = account.data
+  if (!data?.ok || !data.usage) {
+    return { id: account.id, name: account.name, current, groups: [], error: data?.error ?? "agy reported no quota." }
+  }
+  const groups = toGroupViews(data, current ? target.modelId : null)
+  return {
+    id: account.id,
+    name: account.name,
+    current,
+    groups,
+    error: groups.length === 0 ? "agy reported no quota groups." : null,
+  }
+}
+
+/** Every account, the session's own first, then in the order they were added. */
+export function toAccountViews(quota: AccountsQuota, target: SessionTarget | null = null): AccountView[] {
+  const views = quota.accounts.map((account) => toAccountView(account, target))
+  return views.sort((a, b) => Number(b.current) - Number(a.current))
+}
+
 /** "7:03 PM" today, "Mon 2:03 PM" within a week, "Dec 3" after that. */
 export function formatReset(resetAt: number, now: number, locale?: string): string {
   const date = new Date(resetAt)
@@ -95,23 +149,43 @@ export function formatReset(resetAt: number, now: number, locale?: string): stri
 /** Toasts hold up to 500 characters. */
 const SUMMARY_MAX = 500
 
-/**
- * What `/agy-quota` shows: each group's windows with what is left and when it
- * refills. With an Antigravity `modelId`, that group comes first.
- */
-export function quotaSummary(data: QuotaProviderUsageData, now: number, modelId: string | null = null, locale?: string): string {
-  if (!data.ok || !data.usage) return (data.error ?? "agy reported no quota.").slice(0, SUMMARY_MAX)
-  const groups = toGroupViews(data, modelId)
-  if (groups.length === 0) return "agy reported no quota groups."
-  const lines = groups.map((group) => {
-    const windows = group.windows.map((line) => {
-      const left = line.remaining === null ? "–" : `${line.remaining}% left`
-      const refill = line.resetAt !== null && line.resetAt > now ? `, refills ${formatReset(line.resetAt, now, locale)}` : ""
-      return `${line.label} ${left}${refill}`
-    })
-    const tag = group.current ? " (this session)" : ""
-    return `${group.name}${tag}: ${windows.join(" · ")}`
+function groupLine(group: GroupView, now: number, locale: string | undefined, refills: boolean): string {
+  const windows = group.windows.map((line) => {
+    const left = line.remaining === null ? "–" : `${line.remaining}% left`
+    const refill =
+      refills && line.resetAt !== null && line.resetAt > now ? `, refills ${formatReset(line.resetAt, now, locale)}` : ""
+    return `${line.label} ${left}${refill}`
   })
-  const text = `Antigravity quota\n${lines.join("\n")}`
+  const tag = group.current ? " (this session)" : ""
+  return `${group.name}${tag}: ${windows.join(" · ")}`
+}
+
+function summaryText(accounts: readonly AccountView[], now: number, locale: string | undefined, refills: boolean): string {
+  const single = accounts.length === 1
+  const lines: string[] = []
+  for (const account of accounts) {
+    const indent = single ? "" : "  "
+    if (!single) lines.push(`${account.name}${account.current ? " (this session)" : ""}`)
+    if (account.error) lines.push(`${indent}${account.error}`)
+    for (const group of account.groups) lines.push(`${indent}${groupLine(group, now, locale, refills)}`)
+  }
+  return `Antigravity quota\n${lines.join("\n")}`
+}
+
+/**
+ * What `/agy-quota` shows: each account's groups with what is left and when
+ * it refills. The session's account and group come first. Refill times are
+ * dropped when every account would not fit in a toast.
+ */
+export function quotaSummary(
+  quota: AccountsQuota,
+  now: number,
+  target: SessionTarget | null = null,
+  locale?: string,
+): string {
+  const accounts = toAccountViews(quota, target)
+  if (accounts.length === 1 && accounts[0].error) return accounts[0].error.slice(0, SUMMARY_MAX)
+  let text = summaryText(accounts, now, locale, true)
+  if (text.length > SUMMARY_MAX) text = summaryText(accounts, now, locale, false)
   return text.length > SUMMARY_MAX ? `${text.slice(0, SUMMARY_MAX - 1)}…` : text
 }

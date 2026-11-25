@@ -3,12 +3,22 @@ import { existsSync, mkdirSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import type { QuotaProviderUsageData, QuotaProviderWindow } from "@openchamber/sdk"
+import {
+  MAIN_ACCOUNT_ID,
+  accountAgyArgs,
+  accountAgyEnv,
+  accountHome,
+  hasSavedLogin,
+  readAccounts,
+} from "../../src/accounts.ts"
 
 const FIVE_HOURS = 5 * 3_600
 const DAY = 24 * 3_600
 const WEEK = 7 * DAY
 /** Inside OpenChamber's 20 s deadline for one service request. */
 const AGY_TIMEOUT_MS = 15_000
+/** Each run takes about 240 MB, so at most this many accounts are read at once. */
+const PARALLEL_READS = 3
 const ERROR_MAX = 2_000
 
 interface AgyBucket {
@@ -115,13 +125,21 @@ export function failure(error: string): QuotaProviderUsageData {
   return { ok: false, configured: true, error: error.slice(0, ERROR_MAX), usage: null }
 }
 
-/** Runs `agy -p "/quota"`: a local command, no model turn and no token use. */
-export function runAgyQuota(binary = resolveAgyBinary(), cwd = defaultCwd()): Promise<QuotaProviderUsageData> {
+/**
+ * Runs `agy -p "/quota"`: a local command, no model turn and no token use.
+ * With `home`, it reads that extra account's quota from its own folder.
+ */
+export function runAgyQuota(
+  binary = resolveAgyBinary(),
+  cwd = defaultCwd(),
+  home?: string,
+): Promise<QuotaProviderUsageData> {
   return new Promise((resolve) => {
-    execFile(
+    const args = ["-p", "/quota", "--output-format", "json", ...(home ? accountAgyArgs(home) : [])]
+    const child = execFile(
       binary,
-      ["-p", "/quota", "--output-format", "json"],
-      { cwd, env: agyEnv(), timeout: AGY_TIMEOUT_MS, maxBuffer: 1_000_000 },
+      args,
+      { cwd, env: home ? accountAgyEnv(home, agyEnv()) : agyEnv(), timeout: AGY_TIMEOUT_MS, maxBuffer: 1_000_000 },
       (error, stdout, stderr) => {
         if (error && (error as NodeJS.ErrnoException).code === "ENOENT") {
           resolve(failure(`agy was not found (${binary}). Install the Antigravity CLI or set AGY_BIN.`))
@@ -143,7 +161,50 @@ export function runAgyQuota(binary = resolveAgyBinary(), cwd = defaultCwd()): Pr
         resolve(toUsageData(parsed))
       },
     )
+    // agy would wait for a sign-in code on a signed-out account.
+    child.stdin?.end()
   })
+}
+
+/** One account's quota as the section shows it. */
+export interface AccountQuota {
+  /** "main" for your normal agy login, else the account's ID. */
+  readonly id: string
+  readonly name: string
+  readonly data: QuotaProviderUsageData
+}
+
+/** What GET /usage answers: your normal login first, then each extra account. */
+export interface AccountsQuota {
+  readonly accounts: readonly AccountQuota[]
+}
+
+/** The quota of every account; signed-out accounts say how to sign in instead of running agy. */
+export async function readAllQuotas(
+  binary = resolveAgyBinary(),
+  cwd = defaultCwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<AccountsQuota> {
+  const jobs: Array<() => Promise<AccountQuota>> = [
+    async () => ({ id: MAIN_ACCOUNT_ID, name: "Main", data: await runAgyQuota(binary, cwd) }),
+    ...readAccounts(env).map((account) => async (): Promise<AccountQuota> => {
+      const home = accountHome(account.id, env)
+      const data = hasSavedLogin(home)
+        ? await runAgyQuota(binary, cwd, home)
+        : failure(`Not signed in. Run: agy-accounts login "${account.name}"`)
+      return { id: account.id, name: account.name, data }
+    }),
+  ]
+  const results: AccountQuota[] = new Array(jobs.length)
+  let next = 0
+  const worker = async () => {
+    while (next < jobs.length) {
+      const i = next++
+      results[i] = await jobs[i]()
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(PARALLEL_READS, jobs.length) }, worker))
+  return { accounts: results }
 }
 
 /** agy treats its working folder as a workspace; keep it out of real projects. */

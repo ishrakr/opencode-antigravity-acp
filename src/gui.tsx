@@ -20,7 +20,7 @@ import {
 } from "@opencode/plugin/gui"
 import { AcpRpc, type AcpMode, type AcpSessionState } from "./rpc.js"
 
-const ACP_PROVIDER_ID = "antigravity-acp"
+import { MAIN_PROVIDER_ID, isAntigravityProvider } from "./account-ids.js"
 const ERROR_BACKOFF_MS = 10_000
 
 const MODE_LABELS: Record<AcpMode, string> = {
@@ -274,14 +274,19 @@ interface RpcCallOptions {
   readonly signal?: AbortSignal
 }
 
+/** Picks the account; omitted for the main account. */
+interface AccountTarget {
+  readonly providerID?: string
+}
+
 interface AcpRpcClient {
-  getState(input: { readonly sessionID: string }, options?: RpcCallOptions): Promise<AcpSessionState>
+  getState(input: { readonly sessionID: string } & AccountTarget, options?: RpcCallOptions): Promise<AcpSessionState>
   setMode(
-    input: { readonly sessionID: string; readonly mode: AcpMode },
+    input: { readonly sessionID: string; readonly mode: AcpMode } & AccountTarget,
     options?: RpcCallOptions,
   ): Promise<AcpSessionState>
-  resetSession(input: { readonly sessionID: string }, options?: RpcCallOptions): Promise<AcpSessionState>
-  warmSession(input: { readonly sessionID?: string }, options?: RpcCallOptions): Promise<AcpSessionState>
+  resetSession(input: { readonly sessionID: string } & AccountTarget, options?: RpcCallOptions): Promise<AcpSessionState>
+  warmSession(input: { readonly sessionID?: string } & AccountTarget, options?: RpcCallOptions): Promise<AcpSessionState>
   reloadModels(
     input: Record<string, never>,
     options?: RpcCallOptions,
@@ -307,6 +312,22 @@ export default Plugin.define({
     const requestGen = new Map<string, number>()
     const appliedGen = new Map<string, number>()
     const fetchStatePromises = new Map<string, Promise<void>>()
+    // The Antigravity account (provider) each session's selected model uses.
+    const providerOf = new Map<string, string>()
+    const accountOf = (sessionID: string): AccountTarget => {
+      const providerID = providerOf.get(sessionID)
+      return providerID && providerID !== MAIN_PROVIDER_ID ? { providerID } : {}
+    }
+    /** Shows another account's state after the session's model moves to it. */
+    const trackProvider = (sessionID: string, providerID: string) => {
+      const previous = providerOf.get(sessionID)
+      if (previous === providerID) return
+      providerOf.set(sessionID, providerID)
+      if (previous === undefined) return
+      loaded.delete(sessionID)
+      warmedSessions.delete(sessionID)
+      failedAt.delete(sessionID)
+    }
 
     const nextGen = (sessionID: string): number => {
       const g = (requestGen.get(sessionID) ?? 0) + 1
@@ -371,7 +392,7 @@ export default Plugin.define({
       const gen = nextGen(sessionID)
       inFlight.add(sessionID)
       const p: Promise<void> = getRpc()
-        .getState({ sessionID }, buildOpts(directory))
+        .getState({ sessionID, ...accountOf(sessionID) }, buildOpts(directory))
         .then((next: AcpSessionState) => {
           if (ctx.signal.aborted) return
           updateSessionState(sessionID, next, gen)
@@ -414,7 +435,7 @@ export default Plugin.define({
       warmedSessions.add(sessionID)
       const gen = nextGen(sessionID)
       void getRpc()
-        .warmSession({ sessionID }, buildOpts(directory))
+        .warmSession({ sessionID, ...accountOf(sessionID) }, buildOpts(directory))
         .then((next: AcpSessionState) => {
           if (ctx.signal.aborted) return
           if (!next.starting && !next.connected) {
@@ -538,7 +559,11 @@ export default Plugin.define({
         return undefined
       }
 
-      const authBadgeText = () => state()?.authMethod ?? "Google account"
+      const authBadgeText = () => {
+        const st = state()
+        const account = st?.account && st.account !== "Main" ? st.account : undefined
+        return account ? `${account} · Google account` : (st?.authMethod ?? "Google account")
+      }
 
       const selectMode = async (mode: AcpMode) => {
         if (modeSaving() !== null || activeMode() === mode) return
@@ -548,7 +573,7 @@ export default Plugin.define({
         setModeSaving(mode)
         const gen = nextGen(sid)
         try {
-          const next = await getRpc().setMode({ sessionID: sid, mode }, buildOpts(dir))
+          const next = await getRpc().setMode({ sessionID: sid, mode, ...accountOf(sid) }, buildOpts(dir))
           updateSessionState(sid, next, gen)
         } catch (err) {
           setActionError(fmtErr(err))
@@ -589,7 +614,7 @@ export default Plugin.define({
               <span class="agy-status-text">{statusText()}</span>
             </div>
             <div class="agy-meta-chips">
-              <span class="agy-chip" title="Sign-in method">{authBadgeText()}</span>
+              <span class="agy-chip" title="Account and sign-in method">{authBadgeText()}</span>
             </div>
           </div>
 
@@ -669,9 +694,10 @@ export default Plugin.define({
       order: -10,
       show(input): ComposerPillView | undefined {
         const model = input.screen.composer.model()
-        if (model?.providerID !== ACP_PROVIDER_ID) return undefined
+        if (!isAntigravityProvider(model?.providerID)) return undefined
 
         const sessionID = input.session.id
+        untrack(() => trackProvider(sessionID, model.providerID))
         const directory = input.session.directory
         const [readState] = untrack(() => getSessionSignal(sessionID))
         scheduleInitialFetch(sessionID, directory)
@@ -737,7 +763,7 @@ export default Plugin.define({
           // newer state update that landed mid-flight.
           const gen = nextGen(target.sessionID)
           const next = await getRpc().resetSession(
-            { sessionID: target.sessionID },
+            { sessionID: target.sessionID, ...accountOf(target.sessionID) },
             buildOpts(target.directory),
           )
           updateSessionState(target.sessionID, next, gen)
@@ -775,6 +801,7 @@ export default Plugin.define({
       requestGen.clear()
       appliedGen.clear()
       fetchStatePromises.clear()
+      providerOf.clear()
       for (const t of startingPollTimers.values()) clearTimeout(t)
       startingPollTimers.clear()
       startingPollAttempts.clear()

@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { StringDecoder } from "node:string_decoder"
+import { accountAgyArgs, accountAgyEnv } from "./accounts.js"
 
 export class AgyNotFoundError extends Error {
   constructor(binary: string) {
@@ -408,6 +409,8 @@ export interface AcpProcessOptions {
   readonly cwd: string
   /** The selected sign-in method; the personal Google account when omitted. */
   readonly auth?: AcpAuthConfig
+  /** An extra account's private folder; agy then uses only that folder's login. */
+  readonly accountHome?: string
   readonly binaryPath?: string
   readonly extraDirs?: readonly string[]
   readonly dangerouslySkipPermissions?: boolean
@@ -589,6 +592,7 @@ export class AcpProcess {
   constructor(private readonly options: AcpProcessOptions) {
     this.auth = options.auth ?? { method: "oauth-personal" }
     const args = ["acp", "--stdio", "--process-per-session"]
+    if (options.accountHome) args.push(...accountAgyArgs(options.accountHome))
     if (options.dangerouslySkipPermissions) {
       args.push("--dangerously-skip-permissions")
     }
@@ -601,7 +605,9 @@ export class AcpProcess {
     this.proc = spawn(binary, args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: buildAgySpawnEnv(this.auth),
+      env: options.accountHome
+        ? accountAgyEnv(options.accountHome, buildAgySpawnEnv(this.auth))
+        : buildAgySpawnEnv(this.auth),
       detached: process.platform !== "win32",
     })
 
@@ -1076,9 +1082,14 @@ export class AcpProcess {
 
 export async function discoverAcpModels(
   cwd: string,
-  options?: { readonly binaryPath?: string; readonly auth?: AcpAuthConfig },
+  options?: { readonly binaryPath?: string; readonly auth?: AcpAuthConfig; readonly accountHome?: string },
 ): Promise<readonly AcpDiscoveredModel[]> {
-  const proc = new AcpProcess({ cwd, binaryPath: options?.binaryPath, auth: options?.auth })
+  const proc = new AcpProcess({
+    cwd,
+    binaryPath: options?.binaryPath,
+    auth: options?.auth,
+    accountHome: options?.accountHome,
+  })
   try {
     await proc.initialize()
     await proc.authenticate()

@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { quotaProviderSchemasV1 } from "@openchamber/sdk/schemas"
-import { runAgyQuota, toUsageData, type AgyQuotaOutput } from "../src/quota.ts"
+import { readAllQuotas, runAgyQuota, toUsageData, type AgyQuotaOutput } from "../src/quota.ts"
 
 // Recorded from `agy -p "/quota" --output-format json` (agy 1.5.14).
 const recorded: AgyQuotaOutput = {
@@ -75,6 +75,51 @@ describe("agy /quota to OpenChamber usage", () => {
 
       const missing = await runAgyQuota(path.join(dir, "nope"), dir)
       expect(missing.error).toContain("agy was not found")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("every account", () => {
+  test("reads each signed-in account from its own folder and skips signed-out ones", async () => {
+    const dir = mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "agy-quota-accounts-"))
+    try {
+      const state = path.join(dir, "state")
+      const env = { ...process.env, ANTIGRAVITY_ACP_STATE_DIR: state }
+      const { writeAccounts, prepareAccountHome, accountHome } = await import("../../src/accounts.ts")
+      writeAccounts(
+        [
+          { id: "work", name: "Work", createdAt: 1 },
+          { id: "spare", name: "Spare", createdAt: 2 },
+        ],
+        env,
+      )
+      prepareAccountHome("work", env)
+      prepareAccountHome("spare", env)
+      writeFileSync(path.join(accountHome("work", env), "antigravity-acp", "antigravity-oauth-token"), "x")
+      const log = path.join(dir, "calls.log")
+      const fake = path.join(dir, "agy")
+      // Logs each run's account flags and environment, and answers the recorded quota.
+      writeFileSync(
+        fake,
+        `#!/bin/sh\necho "$* | home=\${GEMINI_HOME:-none} file=\${AGY_ACP_FORCE_FILE_STORAGE:-none}" >> ${log}\ncat <<'EOF'\n${JSON.stringify(recorded)}\nEOF\n`,
+      )
+      chmodSync(fake, 0o755)
+      const result = await readAllQuotas(fake, dir, env)
+      expect(result.accounts.map((a) => [a.id, a.name, a.data.ok])).toEqual([
+        ["main", "Main", true],
+        ["work", "Work", true],
+        ["spare", "Spare", false],
+      ])
+      expect(result.accounts[2].data.error).toContain('agy-accounts login "Spare"')
+      const calls = (await Bun.file(log).text()).trim().split("\n").sort()
+      expect(calls).toHaveLength(2)
+      const workHome = accountHome("work", env)
+      expect(calls).toContain(`-p /quota --output-format json | home=none file=none`)
+      expect(calls).toContain(
+        `-p /quota --output-format json --gemini_dir ${workHome} --app_data_dir antigravity-acp | home=${workHome} file=1`,
+      )
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
