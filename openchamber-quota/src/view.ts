@@ -82,8 +82,8 @@ const windowRank = (key: string) => {
 }
 
 /**
- * Every group, windows shortest first. In an Antigravity session (`modelId`),
- * that session's group comes first and is marked current.
+ * Every group in agy's order, windows shortest first. In an Antigravity
+ * session (`modelId`), that session's group is marked current.
  */
 export function toGroupViews(data: QuotaProviderUsageData, modelId: string | null = null): GroupView[] {
   const models = data.usage?.models ?? {}
@@ -94,7 +94,7 @@ export function toGroupViews(data: QuotaProviderUsageData, modelId: string | nul
       .sort(([a], [b]) => windowRank(a) - windowRank(b))
       .map(([key, window]) => toLine(key, window)),
   }))
-  return groups.sort((a, b) => Number(b.current) - Number(a.current))
+  return groups
 }
 
 export interface AccountView {
@@ -130,10 +130,10 @@ function toAccountView(account: AccountQuota, target: SessionTarget | null): Acc
   }
 }
 
-/** Every account, the session's own first, then in the order they were added. */
+/** Every account in the order added, your normal login first. */
 export function toAccountViews(quota: AccountsQuota, target: SessionTarget | null = null): AccountView[] {
   const views = quota.accounts.map((account) => toAccountView(account, target))
-  return views.sort((a, b) => Number(b.current) - Number(a.current))
+  return views
 }
 
 /** "7:03 PM" today, "Mon 2:03 PM" within a week, "Dec 3" after that. */
@@ -173,7 +173,7 @@ function summaryText(accounts: readonly AccountView[], now: number, locale: stri
 
 /**
  * What `/agy-quota` shows: each account's groups with what is left and when
- * it refills. The session's account and group come first. Refill times are
+ * it refills, in a fixed order. Refill times are
  * dropped when every account would not fit in a toast.
  */
 export function quotaSummary(

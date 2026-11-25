@@ -2,9 +2,9 @@
 
 An OpenChamber extension that adds an **Antigravity** section to Work Status: the remaining 5-hour and weekly limits of each Antigravity model group (Gemini, Claude & GPT), with refill times.
 
-It shows both groups in every session. In a session that uses an Antigravity model, that session's group comes first.
+It shows both groups in every session, always in the same order. In a session that uses an Antigravity model, the other group is dimmed.
 
-With [separate accounts](../README.md#separate-accounts) it lists every account under its name: your normal login as "Main", then each account you added. The session's own account comes first. An account that isn't signed in shows the command that signs it in. With only your normal login, the section looks as it always did.
+With [separate accounts](../README.md#separate-accounts) it lists every account under its name: your normal login as "Main", then each account you added. The order never changes; in an Antigravity session the other accounts are dimmed. An account that isn't signed in shows the command that signs it in. With only your normal login, the section looks as it always did.
 
 It adds no card to Settings → Usage, so Antigravity no longer appears in OpenChamber's general Usage section.
 

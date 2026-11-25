@@ -62,17 +62,17 @@ describe("group views", () => {
     expect(shortGroupName("Claude and GPT models")).toBe("Claude & GPT")
   })
 
-  test("the session's group comes first, with remaining percent, 5-hour before weekly", () => {
+  test("groups keep agy's order with the session's marked, 5-hour before weekly", () => {
     const views = toGroupViews(usage, "claude-opus-5-5")
     expect(views.map((v) => [v.name, v.current])).toEqual([
-      ["Claude & GPT", true],
       ["Gemini", false],
+      ["Claude & GPT", true],
     ])
-    expect(views[0].windows.map((w) => [w.label, w.remaining, w.tone])).toEqual([
+    expect(views[1].windows.map((w) => [w.label, w.remaining, w.tone])).toEqual([
       ["5-hour", 100, "success"],
       ["Weekly", 42, "warning"],
     ])
-    expect(toGroupViews(usage, "gemini-4-neon")[0].name).toBe("Gemini")
+    expect(toGroupViews(usage, "gemini-4-neon").map((g) => g.name)).toEqual(["Gemini", "Claude & GPT"])
     // Outside Antigravity sessions every group shows, none marked.
     const plain = toGroupViews(usage)
     expect(plain.map((g) => g.name)).toEqual(["Gemini", "Claude & GPT"])
@@ -102,11 +102,11 @@ describe("/agy-quota summary", () => {
     expect(text.length).toBeLessThanOrEqual(500)
   })
 
-  test("puts the session's group first and marks it", () => {
+  test("keeps the same order in an Antigravity session, unlabelled", () => {
     const lines = quotaSummary(main(), now, { account: "main", modelId: "claude-opus-5-5" }, "en-US").split("\n")
-    expect(lines[1]).toStartWith("Claude & GPT: ")
+    expect(lines[1]).toStartWith("Gemini: ")
+    expect(lines[2]).toStartWith("Claude & GPT: ")
     expect(lines.join("\n")).not.toContain("this session")
-    expect(lines[2]).toStartWith("Gemini: ")
   })
 
   test("omits refill times that have passed", () => {
@@ -141,16 +141,16 @@ describe("several accounts", () => {
     ],
   }
 
-  test("every account shows; the session's account comes first with its group marked", () => {
+  test("every account shows in the order added, the session's account and group marked", () => {
     const views = toAccountViews(quota, { account: "work", modelId: "gemini-4-neon" })
     expect(views.map((v) => [v.name, v.current])).toEqual([
-      ["Work", true],
       ["Main", false],
+      ["Work", true],
       ["Spare", false],
     ])
-    expect(views[0].groups[0]).toMatchObject({ name: "Gemini", current: true })
+    expect(views[1].groups[0]).toMatchObject({ name: "Gemini", current: true })
     // The same model on another account is not this session's quota.
-    expect(views[1].groups.some((g) => g.current)).toBe(false)
+    expect(views[0].groups.some((g) => g.current)).toBe(false)
     expect(views[2].error).toContain("agy-accounts login")
   })
 
@@ -163,10 +163,10 @@ describe("several accounts", () => {
   test("the summary names each account and fits a toast", () => {
     const text = quotaSummary(quota, now, { account: "work", modelId: "claude-opus-5-5" }, "en-US")
     const lines = text.split("\n")
-    expect(lines[1]).toBe("Work")
-    expect(lines[2]).toStartWith("  Claude & GPT: ")
+    expect(lines[1]).toBe("Main")
+    expect(lines[2]).toStartWith("  Gemini: ")
     expect(text).not.toContain("this session")
-    expect(text).toContain("\nMain\n")
+    expect(text).toContain("\nWork\n  Gemini: ")
     expect(text).toContain('  Not signed in. Run: agy-accounts login "Spare"')
     expect(text.length).toBeLessThanOrEqual(500)
   })

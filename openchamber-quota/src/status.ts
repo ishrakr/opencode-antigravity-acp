@@ -1,6 +1,6 @@
 // The Antigravity section in Work Status. It shows every account's quota in
-// every session; in an Antigravity session that session's account and group
-// come first.
+// every session, always in the same order; in an Antigravity session the
+// other accounts and groups are dimmed.
 import { connectHost, HostRequestError } from "@openchamber/sdk"
 import { applyHostReady } from "@openchamber/sdk/ui"
 import type { AccountsQuota } from "./quota.ts"
