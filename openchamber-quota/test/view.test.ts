@@ -104,7 +104,8 @@ describe("/agy-quota summary", () => {
 
   test("puts the session's group first and marks it", () => {
     const lines = quotaSummary(main(), now, { account: "main", modelId: "claude-opus-5-5" }, "en-US").split("\n")
-    expect(lines[1]).toStartWith("Claude & GPT (this session): ")
+    expect(lines[1]).toStartWith("Claude & GPT: ")
+    expect(lines.join("\n")).not.toContain("this session")
     expect(lines[2]).toStartWith("Gemini: ")
   })
 
@@ -162,8 +163,9 @@ describe("several accounts", () => {
   test("the summary names each account and fits a toast", () => {
     const text = quotaSummary(quota, now, { account: "work", modelId: "claude-opus-5-5" }, "en-US")
     const lines = text.split("\n")
-    expect(lines[1]).toBe("Work (this session)")
-    expect(lines[2]).toStartWith("  Claude & GPT (this session): ")
+    expect(lines[1]).toBe("Work")
+    expect(lines[2]).toStartWith("  Claude & GPT: ")
+    expect(text).not.toContain("this session")
     expect(text).toContain("\nMain\n")
     expect(text).toContain('  Not signed in. Run: agy-accounts login "Spare"')
     expect(text.length).toBeLessThanOrEqual(500)

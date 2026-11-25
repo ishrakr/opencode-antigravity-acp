@@ -1,6 +1,6 @@
 {
   "name": "antigravity-quota",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Antigravity quota in OpenChamber's Work Status, read from agy's own /quota command",
   "private": true,
   "type": "module",

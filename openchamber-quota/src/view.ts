@@ -156,8 +156,7 @@ function groupLine(group: GroupView, now: number, locale: string | undefined, re
       refills && line.resetAt !== null && line.resetAt > now ? `, refills ${formatReset(line.resetAt, now, locale)}` : ""
     return `${line.label} ${left}${refill}`
   })
-  const tag = group.current ? " (this session)" : ""
-  return `${group.name}${tag}: ${windows.join(" · ")}`
+  return `${group.name}: ${windows.join(" · ")}`
 }
 
 function summaryText(accounts: readonly AccountView[], now: number, locale: string | undefined, refills: boolean): string {
@@ -165,7 +164,7 @@ function summaryText(accounts: readonly AccountView[], now: number, locale: stri
   const lines: string[] = []
   for (const account of accounts) {
     const indent = single ? "" : "  "
-    if (!single) lines.push(`${account.name}${account.current ? " (this session)" : ""}`)
+    if (!single) lines.push(account.name)
     if (account.error) lines.push(`${indent}${account.error}`)
     for (const group of account.groups) lines.push(`${indent}${groupLine(group, now, locale, refills)}`)
   }

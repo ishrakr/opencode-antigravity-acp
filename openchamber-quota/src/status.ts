@@ -32,12 +32,10 @@ style.textContent = `
   .group { display: flex; flex-direction: column; gap: 4px; }
   .group.other { opacity: .7; }
   .name { display: flex; align-items: baseline; gap: 6px; font-weight: 600; }
-  .tag { font-weight: 400; font-size: 11px; color: var(--oc-muted); }
   .account { display: flex; flex-direction: column; gap: 6px; }
   .account + .account { border-top: 1px solid var(--oc-border); padding-top: 8px; }
   .account.other { opacity: .75; }
   .account-name { display: flex; align-items: baseline; gap: 6px; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--oc-muted); }
-  .account-name .tag { text-transform: none; letter-spacing: 0; }
   .line { display: grid; grid-template-columns: 52px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
   .what { color: var(--oc-muted); }
   .meter { height: 5px; border-radius: 3px; overflow: hidden; background: color-mix(in srgb, var(--oc-fg) 8%, transparent); }
@@ -73,7 +71,6 @@ const note = (text: string, error = false) => root.replaceChildren(el("div", err
 function drawGroup(group: GroupView, now: number, marked: boolean): HTMLElement {
   const box = el("div", group.current || !marked ? "group" : "group other")
   const name = el("div", "name", group.name)
-  if (group.current) name.append(el("span", "tag", "this session"))
   box.append(name)
   for (const line of group.windows) {
     const fill = el("span")
@@ -104,7 +101,6 @@ function drawGroups(account: AccountView, now: number): HTMLElement[] {
 function drawAccount(account: AccountView, now: number, marked: boolean): HTMLElement {
   const box = el("div", account.current || !marked ? "account" : "account other")
   const name = el("div", "account-name", account.name)
-  if (account.current) name.append(el("span", "tag", "this session"))
   box.append(name, ...drawGroups(account, now))
   return box
 }
