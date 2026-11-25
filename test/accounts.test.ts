@@ -295,8 +295,17 @@ describe("account bridges", () => {
       await Promise.all([main.refreshModels({ force: true }), work.refreshModels({ force: true })])
       expect(main.getModels().map((m) => m.id)).toEqual(["gemini-4-neon", "claude-opus-5-5"])
       expect(work.getModels().map((m) => m.id)).toEqual(["gemini-3.8-flash"])
-      expect((store.get("antigravity-acp:account:work:model-catalog:v1") as any).models).toHaveLength(1)
-      expect((store.get("antigravity-acp:model-catalog:v1") as any).models).toHaveLength(2)
+      expect((store.get("antigravity-acp:account:work:model-catalog:v2") as any).models).toHaveLength(1)
+      expect((store.get("antigravity-acp:model-catalog:v2") as any).models).toHaveLength(2)
+      // A list saved by 0.4.0, possibly another account's, is ignored.
+      resetSharedCatalogForTests()
+      const legacyStore = new Map<string, unknown>([
+        ["antigravity-acp:model-catalog:v1", { version: 1, updatedAt: Date.now(), models: [model("gemini-3.8-flash")] }],
+      ])
+      const fresh = new SessionBridgeManager(makeCtx(legacyStore), "/tmp/w")
+      expect((await fresh.loadCachedModels()).stale).toBe(true)
+      expect(fresh.getModels().length).toBeGreaterThan(1)
+      await fresh.disposeAll()
       // After a restart each account reads its own saved list.
       resetSharedCatalogForTests()
       const again = new SessionBridgeManager(ctx, "/tmp/w", {

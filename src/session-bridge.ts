@@ -227,7 +227,9 @@ function storageKeys(accountId: string) {
     session: `${scope}:session:`,
     turns: `${scope}:turns:`,
     cooldown: `${scope}:cooldown`,
-    catalog: `${scope}:model-catalog:v1`,
+    // v2: 0.4.0 saved whichever account last read its models under every
+    // account's key, so lists saved before per-account lists are not trusted.
+    catalog: `${scope}:model-catalog:v2`,
   }
 }
 const MODEL_CATALOG_TTL_MS = 6 * 60 * 60 * 1000
