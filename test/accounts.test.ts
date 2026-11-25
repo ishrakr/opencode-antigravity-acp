@@ -19,12 +19,7 @@ import {
   writeAccounts,
 } from "../src/accounts.js"
 import { hasNonAcpAssistantHistory, isLocalStatusMessage } from "../src/history-sanitizer.js"
-import {
-  FOREIGN_HISTORY_MESSAGE,
-  SessionBridgeManager,
-  accountSwitchNotice,
-  resetSharedCatalogForTests,
-} from "../src/session-bridge.js"
+import { FOREIGN_HISTORY_MESSAGE, SessionBridgeManager, resetSharedCatalogForTests } from "../src/session-bridge.js"
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "agy-accounts-"))
@@ -217,7 +212,7 @@ describe("account bridges", () => {
     }
   })
 
-  test("a reply whose provider cannot be confirmed locks the session like another model's", async () => {
+  test("a session stays on its account: another account's replies lock it like another model's", async () => {
     const main = [{ role: "user", content: [{ type: "text", text: "hi" }] }]
     const fromWork = {
       role: "assistant",
@@ -314,86 +309,5 @@ describe("account bridges", () => {
       await Promise.all([main.disposeAll(), work.disposeAll()])
       resetSharedCatalogForTests()
     }
-  })
-
-  describe("switching a session to another account", () => {
-    const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] })
-    // On the new account, the other account's reply arrives without a marker.
-    const history = [user("first question"), { role: "assistant", content: [{ type: "text", text: "answer from Work" }] }, user("next")]
-    const stored = (providers: string[]) =>
-      [
-        ...providers.map((providerID) => ({
-          type: "assistant",
-          model: { id: "gemini-4-neon", providerID },
-          time: { created: 1, completed: 2 },
-        })),
-        // The reply being written on this account, not finished yet.
-        { type: "assistant", model: { id: "gemini-4-neon", providerID: "antigravity-acp-spare" }, time: { created: 3 } },
-      ]
-
-    function spareBridge(replies: unknown[], prompts: unknown[][], onSessionMoved?: (sid: string) => Promise<void>) {
-      const ctx = makeCtx()
-      ctx.session.context = () => Effect.succeed(replies)
-      return new SessionBridgeManager(ctx, "/tmp/acp-test-dir", {
-        account: { id: "spare", name: "Spare", home: "/acct/spare" },
-        onSessionMoved,
-        createProc: (opts: any) =>
-          ({
-            isClosed: false,
-            initialize: async () => ({}),
-            authenticate: async () => ({}),
-            newSession: async () => ({ sessionId: "acp-spare" }),
-            setModel: async () => {},
-            setMode: async () => {},
-            notifyCancel: () => {},
-            dispose: async () => {},
-            closeSession: async () => {},
-            prompt: async (sid: string, blocks: unknown[]) => {
-              prompts.push(blocks)
-              opts.onUpdate?.(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } })
-              return { stopReason: "end_turn" }
-            },
-          }) as any,
-      })
-    }
-
-    test("carries the conversation over, says so, and releases the old account", async () => {
-      const prompts: unknown[][] = []
-      const released: string[] = []
-      const bridge = spareBridge(stored(["antigravity-acp-work"]), prompts, async (sid) => void released.push(sid))
-      try {
-        const { stream } = await bridge.createLanguageModel("gemini-4-neon").doStream({
-          prompt: history,
-          headers: { "x-opencode-session-id": "ses-move" },
-        } as any)
-        const text = (await readAll(stream)).filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
-        expect(text).toStartWith(accountSwitchNotice("Spare"))
-        expect(released).toEqual(["ses-move"])
-        const sent = JSON.stringify(prompts[0])
-        expect(sent).toContain("moved here from another Antigravity account")
-        expect(sent).toContain("answer from Work")
-        expect(sent).toContain("next")
-      } finally {
-        await bridge.disposeAll()
-      }
-    })
-
-    test("another model's replies still lock the session", async () => {
-      const prompts: unknown[][] = []
-      for (const replies of [stored(["antigravity-acp-work", "fs-cortex"]), stored([])]) {
-        const bridge = spareBridge(replies, prompts)
-        try {
-          const { stream } = await bridge.createLanguageModel("gemini-4-neon").doStream({
-            prompt: history,
-            headers: { "x-opencode-session-id": "ses-lock" },
-          } as any)
-          const text = (await readAll(stream)).filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
-          expect(text).toBe(FOREIGN_HISTORY_MESSAGE)
-        } finally {
-          await bridge.disposeAll()
-        }
-      }
-      expect(prompts).toEqual([])
-    })
   })
 })

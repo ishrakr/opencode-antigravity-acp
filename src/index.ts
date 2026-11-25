@@ -79,20 +79,11 @@ export default Plugin.define({
       // Your normal agy login, then one provider per extra account (as in
       // T3 Code). A session uses the account whose model it picked; nothing
       // switches accounts on its own. Accounts load when OpenCode starts.
-      const bridges = new Map<string, SessionBridgeManager>()
-      // A session you moved to another account: the accounts it left stop
-      // their process for it, so only one account works on a session.
-      const releaseElsewhere = (providerID: string) => async (sessionID: string) => {
-        for (const [id, b] of bridges) {
-          if (id !== providerID && b.hasSession(sessionID)) await b.resetSession(sessionID)
-        }
-      }
       const bridge = new SessionBridgeManager(ctx, ctx.location.directory, {
         auth,
         onCatalogChanged: reloadProviders,
-        onSessionMoved: releaseElsewhere(MAIN_PROVIDER_ID),
       })
-      bridges.set(MAIN_PROVIDER_ID, bridge)
+      const bridges = new Map<string, SessionBridgeManager>([[MAIN_PROVIDER_ID, bridge]])
       for (const account of readAccounts()) {
         let home: string
         try {
@@ -107,7 +98,6 @@ export default Plugin.define({
             auth: { method: "oauth-personal" },
             account: { id: account.id, name: account.name, home },
             onCatalogChanged: reloadProviders,
-            onSessionMoved: releaseElsewhere(accountProviderID(account.id)),
           }),
         )
       }

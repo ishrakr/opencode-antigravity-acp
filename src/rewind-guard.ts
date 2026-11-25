@@ -109,10 +109,7 @@ function messageText(msg: LanguageModelV3Prompt[number]): string {
  * The conversation kept before the latest message, for a fresh agy session.
  * Newest messages win when it is too long. `undefined` when nothing was kept.
  */
-export function buildKeptConversation(
-  prompt: LanguageModelV3Prompt,
-  reason = "Messages in this conversation were rewound or edited, so it continues in a new session.",
-): string | undefined {
+export function buildKeptConversation(prompt: LanguageModelV3Prompt): string | undefined {
   const nonSystem = prompt.filter((m) => m.role === "user" || m.role === "assistant")
   let lastUser = nonSystem.length - 1
   while (lastUser >= 0 && nonSystem[lastUser].role !== "user") lastUser--
@@ -130,7 +127,7 @@ export function buildKeptConversation(
   if (entries.length === 0) return undefined
   return [
     "<earlier_conversation>",
-    `${reason} This is the conversation so far; continue from it. Files may differ from what it describes.`,
+    "Messages in this conversation were rewound or edited, so it continues in a new session. This is the conversation so far; continue from it. Files may differ from what it describes.",
     "",
     entries.join("\n\n"),
     "</earlier_conversation>",

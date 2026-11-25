@@ -35,8 +35,8 @@ Pull requests **must** preserve these core invariants:
 
 - **Official ACP only:** Never extract OAuth tokens from Antigravity storage, spoof client headers, or call private Cloud Code HTTP endpoints directly.
 - **Antigravity is the agent:** Never send OpenCode's system prompt, agents, skills or tools to `agy acp`, and never attach MCP servers to its sessions.
-- **No replay:** Send only the latest user message and its attachments. Never send earlier turns, and never hand `agy` a conversation another model took part in. Two exceptions hand a fresh `agy` session the kept Antigravity conversation once (`src/rewind-guard.ts`): a rewind or edit in OpenCode, and the user moving a session to another Antigravity account.
-- **User-chosen accounts only:** A session runs on the account whose model the user picked. Never switch, rotate or pool accounts automatically, for example on a quota error.
+- **No replay:** Send only the latest user message and its attachments. Never send earlier turns, and never hand `agy` a conversation another model took part in. The one exception is a rewind or edit in OpenCode: the replacement `agy` session gets the kept Antigravity conversation once (`src/rewind-guard.ts`).
+- **One account per session:** A session runs on the account whose model the user picked and stays there. Never move a conversation to another account, and never switch, rotate or pool accounts, for example on a quota error.
 - **Selected sign-in only:** Use exactly the sign-in method the user configured. Never fall back to another method or read ambient `GEMINI_API_KEY` / `GOOGLE_*` credentials.
 - **Interactive turns only:** Don't send OpenCode's auxiliary requests (compaction, generate, title) to `agy`, and don't add automation that prompts `agy` without the user.
 - **Fail-fast on upstream errors:** Do not add automatic retry loops on `429` / quota / permission errors, and never emit retryable stream errors on plugin unload.

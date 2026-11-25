@@ -938,7 +938,7 @@ export class AcpProcess {
         // Form elicitation makes agy send `ask_question` as `elicitation/create`,
         // which supports multiple questions, multi-select and typed answers.
         clientCapabilities: { elicitation: { form: {} } },
-        clientInfo: { name: "acp-bridge", version: "0.5.0" },
+        clientInfo: { name: "acp-bridge", version: "0.5.1" },
       },
       15_000,
     )

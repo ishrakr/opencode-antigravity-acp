@@ -83,7 +83,7 @@ node ~/path/to/opencode-antigravity-acp/bin/agy-accounts.js add "Work"
 - Each account lives in `~/.local/state/opencode-antigravity-acp/accounts/<id>` (set `ANTIGRAVITY_ACP_STATE_DIR` to move it). As in T3 Code, the plugin starts `agy` with that folder as `GEMINI_HOME`, `--gemini_dir` and `--app_data_dir antigravity-acp`, with `AGY_ACP_FORCE_FILE_STORAGE=1` and a placeholder `SSH_CONNECTION`, so the login is kept in a file in that folder instead of the OS keyring entry every account would share. Google API keys and Cloud variables are removed from its environment.
 - Your `AGENTS.md`, `GEMINI.md` and skills in `~/.gemini` are linked into each folder, so every account follows the same rules. Logins and MCP settings stay separate.
 - Extra accounts always use their own Google login, whatever `authMethod` the main provider uses.
-- **Switching a session to another account:** pick a model under the other account. Its next reply starts a new Antigravity conversation on that account, is given the conversation so far (as after a rewind), and says it switched; the account you left stops its process for that session. Nothing switches on its own. A session that has replies from a non-Antigravity model still can't be continued by Antigravity.
+- **One account per session.** After an account has replied in a session, another account's models decline to continue it, as they do for another model's replies. To use another account, start a new session. Moving a conversation between accounts would amount to rotating accounts, which Google's terms forbid.
 - A signed-out account answers with the command to sign it in.
 
 ---

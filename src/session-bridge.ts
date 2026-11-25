@@ -38,7 +38,7 @@ import {
   hasNonAcpAssistantHistory,
   isSyntheticRestartAfterError,
 } from "./history-sanitizer.js"
-import { MAIN_ACCOUNT_ID, accountProviderID, isAntigravityProvider } from "./account-ids.js"
+import { MAIN_ACCOUNT_ID, accountProviderID } from "./account-ids.js"
 import type { AcpMode, AcpSessionState } from "./rpc.js"
 import {
   buildKeptConversation,
@@ -91,14 +91,9 @@ interface SessionContextSnapshot {
 
 type SessionPublicState = AcpSessionState
 
-/** Shown when a session already holds turns from a model outside Antigravity. */
+/** Shown when a session already holds turns from another model or another Antigravity account. */
 export const FOREIGN_HISTORY_MESSAGE =
-  "This session already has replies from another model. Antigravity only continues its own conversations, so it won't read them. Start a new session to use Antigravity."
-
-/** Shown when you move a session to another Antigravity account. */
-export function accountSwitchNotice(accountName: string): string {
-  return `Switched this session to the Antigravity account "${accountName}". Antigravity started a new conversation there and was given the conversation so far.\n\n`
-}
+  "This session already has replies from another model or another Antigravity account. Antigravity only continues its own conversations, and each session stays on one account, so it won't read them. Start a new session to use this model."
 
 /** Permission metadata key holding agy's warning for an "Allow always" choice. */
 export const ANTIGRAVITY_WARNING_METADATA_KEY = "antigravityWarning"
@@ -415,7 +410,6 @@ export class SessionBridgeManager {
   /** Until its own list is read, the main account shows the built-in list and an extra account none. */
   private catalog: readonly AcpDiscoveredModel[]
   private onCatalogChanged?: () => void
-  private onSessionMoved?: (sessionID: string) => Promise<void>
   private discoverModelsFn: (cwd: string) => Promise<readonly AcpDiscoveredModel[]>
   private createProcFn: (options: AcpProcessOptions) => AcpProcess
   private cooldownsByBucket = new Map<CooldownBucket, { until: number; reason: string }>()
@@ -448,8 +442,6 @@ export class SessionBridgeManager {
       readonly attachmentsDir?: string
       /** The account this bridge runs as; your normal agy login when omitted. */
       readonly account?: BridgeAccount
-      /** A session moved to this account: other accounts release it. */
-      readonly onSessionMoved?: (sessionID: string) => Promise<void>
     },
   ) {
     this.auth = options?.auth ?? { method: "oauth-personal" }
@@ -461,7 +453,6 @@ export class SessionBridgeManager {
     this.attachmentsDir = options?.attachmentsDir ?? defaultAttachmentsDir(this.account.id)
     this.catalog = catalogs.get(this.account.id)?.models ?? (this.account.home ? [] : FALLBACK_MODELS)
     this.onCatalogChanged = options?.onCatalogChanged
-    this.onSessionMoved = options?.onSessionMoved
     this.discoverModelsFn =
       options?.discoverModels ??
       ((cwd) => discoverAcpModels(cwd, { auth: this.auth, accountHome: this.account.home }))
@@ -861,30 +852,6 @@ export class SessionBridgeManager {
   private untrackWarmedIdle(sessionID: string): void {
     const idx = this.warmedIdleSessions.indexOf(sessionID)
     if (idx !== -1) this.warmedIdleSessions.splice(idx, 1)
-  }
-
-  /**
-   * Which providers replied in this session, from OpenCode's stored messages.
-   * OpenCode hands a reply's metadata only to the provider that wrote it, so
-   * this is the only way to tell another Antigravity account's replies from
-   * another model's. Unknown when the history cannot be read.
-   */
-  private async replyProviders(sessionID: string): Promise<string[] | undefined> {
-    try {
-      const messages = (await Effect.runPromise(
-        (this.ctx.session as any).context({ sessionID }),
-      )) as ReadonlyArray<{
-        readonly type?: string
-        readonly model?: { readonly providerID?: string }
-        readonly time?: { readonly completed?: number }
-      }>
-      // The reply being written is already stored; only finished ones count.
-      return messages
-        .filter((m) => m?.type === "assistant" && typeof m.model?.providerID === "string" && m.time?.completed)
-        .map((m) => m.model!.providerID!)
-    } catch {
-      return undefined
-    }
   }
 
   /** For an extra account agy cannot use yet: how to sign it in. */
@@ -2260,19 +2227,14 @@ export class SessionBridgeManager {
         }
 
         // T3 Code keeps a thread on one provider. A session that already has
-        // replies from another model stays there: Antigravity is never handed
-        // that model's conversation. Replies from another Antigravity account
-        // look the same in the prompt; those you may move between, by picking
-        // the other account's model (never automatically).
-        let switchedAccount = false
+        // replies from another model, or from another Antigravity account,
+        // stays there: Antigravity is never handed that conversation. OpenCode
+        // passes a reply's marker only to the provider that wrote it, so
+        // another account's replies look like another model's here.
         if (hasNonAcpAssistantHistory(options.prompt)) {
-          const providers = await bridge.replyProviders(sessionID)
-          if (!providers || providers.length === 0 || !providers.every(isAntigravityProvider)) {
-            return {
-              stream: bridge.createImmediateTextStream(FOREIGN_HISTORY_MESSAGE, "foreign_history"),
-            }
+          return {
+            stream: bridge.createImmediateTextStream(FOREIGN_HISTORY_MESSAGE, "foreign_history"),
           }
-          switchedAccount = providers[providers.length - 1] !== bridge.providerID
         }
 
         let target: ReturnType<typeof resolveAcpModelTarget>
@@ -2400,14 +2362,7 @@ export class SessionBridgeManager {
         const turnHistory = readTurnHistory(options.prompt)
         const delivered = await bridge.loadDeliveredTurns(sessionID)
         let rewound = false
-        if (switchedAccount) {
-          // This account's agy has not seen the other account's replies: it
-          // starts a new conversation and gets the one so far. The account
-          // the session left stops its process for this session.
-          bridge.diag(s, "account switch: the latest reply came from another account; starting fresh")
-          await bridge.resetSession(sessionID)
-          await bridge.onSessionMoved?.(sessionID).catch(() => {})
-        } else if (delivered && historyDiverged(delivered, turnHistory)) {
+        if (delivered && historyDiverged(delivered, turnHistory)) {
           const currentAcpId = s.acpSessionId ?? (await bridge.runStorageGet(sessionID))
           if (currentAcpId === delivered.acpSessionId) {
             bridge.diag(s, "rewind: OpenCode history diverged from agy session; starting fresh")
@@ -2517,14 +2472,7 @@ export class SessionBridgeManager {
         const promptBlocks = buildThinAcpPromptBlocks(options.prompt, {
           storeAttachment: (file) => bridge.storeAttachment(sessionID, file),
         })
-        const keptConversation = switchedAccount
-          ? buildKeptConversation(
-              options.prompt,
-              "This conversation moved here from another Antigravity account, so it continues in a new session.",
-            )
-          : rewound
-            ? buildKeptConversation(options.prompt)
-            : undefined
+        const keptConversation = rewound ? buildKeptConversation(options.prompt) : undefined
         if (keptConversation) promptBlocks.unshift({ type: "text", text: keptConversation })
         const deliveredRecord = recordDelivery(turnHistory, acpSessionId)
 
@@ -2541,8 +2489,7 @@ export class SessionBridgeManager {
         s.activeTurn = turn
 
         const stream = bridge.createBoundStream(s, turn, options.abortSignal, () => {
-          if (switchedAccount) bridge.emitLocalNotice(turn, accountSwitchNotice(bridge.account.name))
-          else if (rewound) bridge.emitLocalNotice(turn, REWIND_NOTICE)
+          if (rewound) bridge.emitLocalNotice(turn, REWIND_NOTICE)
           else if (showResumeLost) bridge.emitLocalNotice(turn, RESUME_LOST_NOTICE)
           const pending = proc.prompt(acpSessionId, promptBlocks)
           if (deliveredRecord) void bridge.saveDeliveredTurns(sessionID, deliveredRecord)
